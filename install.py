@@ -1,5 +1,6 @@
 import launch
 import os
+import shutil
 import importlib.metadata
 import importlib.util
 from packaging.version import Version
@@ -19,8 +20,8 @@ requirements = [
 "pytorch-optimizer",
 "torchao",
 # Easy LoRA / local WD14 tagging
+# (onnxruntime is handled separately below: gpu/cpu builds must not coexist)
 "huggingface_hub>=0.24",
-"onnxruntime-gpu>=1.18",
 ]
 
 def is_installed(pip_package):
@@ -56,7 +57,30 @@ def is_installed(pip_package):
 
 for module in requirements:
     if not is_installed(module):
-        launch.run_pip(f"install {module}", module)
+        # Quote the requirement: unquoted ">=" is a shell redirect on Linux/Colab,
+        # which silently drops the version constraint and creates a stray file.
+        launch.run_pip(f'install "{module}"', module)
+
+
+def ensure_onnxruntime():
+    """Easy LoRA's WD14 tagger needs onnxruntime (GPU build if an NVIDIA GPU exists).
+
+    - If either `onnxruntime-gpu` or `onnxruntime` (>=1.18) is already installed, keep it.
+      Installing the other one on top makes both packages overwrite each other's files and
+      usually leaves you with a broken CUDA provider.
+    - If neither is installed, pick the GPU build only when nvidia-smi is available.
+    """
+    for name in ("onnxruntime-gpu", "onnxruntime"):
+        try:
+            if Version(importlib.metadata.version(name)) >= Version("1.18"):
+                return
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    package = "onnxruntime-gpu>=1.18" if shutil.which("nvidia-smi") else "onnxruntime>=1.18"
+    launch.run_pip(f'install "{package}"', "onnxruntime for Easy LoRA tagger")
+
+
+ensure_onnxruntime()
 
 try:
     from ldm_patched.modules import model_management
