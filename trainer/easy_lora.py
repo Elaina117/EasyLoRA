@@ -16,13 +16,16 @@ TrainTrainの学習エンジンとは独立しており、Kohya/TrainTrain互換
 from __future__ import annotations
 
 import csv
+import contextlib
 import gc
 import hashlib
+import html as html_lib
 import json
 import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
 from collections import Counter
@@ -793,15 +796,12 @@ def decide_tags(per_image_sets: list[set[str]], tag_category: dict[str, str], pr
 # トリガーワード・ステップ数
 # ---------------------------------------------------------------------------
 
-def resolve_trigger(trigger: str, dataset_name: str) -> str:
-    """トリガーワードが空なら、データセット名から自動で作る。"""
-    t = (trigger or "").strip()
-    if t:
-        return t
-    slug = re.sub(r"[^a-z0-9]+", "", (dataset_name or "").lower())[:12]
-    if not slug:
-        slug = hashlib.sha1((dataset_name or "lora").encode("utf-8")).hexdigest()[:6]
-    return f"elora_{slug}"
+def resolve_trigger(trigger: str, dataset_name: str = "") -> str:
+    """トリガーワード。基本は不要なので、空欄なら「なし」（空文字）のまま。
+
+    dataset_name は以前の自動生成の名残で、互換性のために引数だけ残している。
+    """
+    return (trigger or "").strip()
 
 
 def auto_steps(image_count: int, preset_name: str) -> int:
@@ -1295,14 +1295,151 @@ def start_training(
     save_dir = getattr(trainer_module, "lora_dir", None)
     saved = save_dir and os.path.exists(os.path.join(save_dir, f"{name}.safetensors"))
     if saved:
+        if (trigger or "").strip():
+            usage = f"プロンプトに `{trigger}` を入れて、`<lora:{name}:1>` を追加"
+        else:
+            usage = f"プロンプトに `<lora:{name}:1>` を追加するだけで使えます（トリガーワードなし）"
         return (
             f"### ✅ 学習完了\n\n"
             f"- 出力: `{name}.safetensors`\n"
-            f"- 使い方: プロンプトに `{trigger}` を入れて、`<lora:{name}:1>` を追加\n"
+            f"- 使い方: {usage}\n"
             f"- 効きすぎ/弱すぎる時は `:1` を `:0.6` や `:1.2` に変えて調整\n\n"
             f"（TrainTrainからのメッセージ: {result}）"
         )
     return f"### 学習が終了しました\n\nTrainTrainからのメッセージ: {result}"
+
+
+# ---------------------------------------------------------------------------
+# 進捗表示（準備・学習の両方で使う）
+# ---------------------------------------------------------------------------
+
+class ProgressTracker:
+    """作業スレッドが書き込み、UI側（ジェネレータ）が読む、スレッドセーフな進捗の入れ物。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = {"title": "", "frac": None, "detail": ""}
+
+    def set(self, title: str, frac: Optional[float] = None, detail: str = ""):
+        with self._lock:
+            self._state = {"title": title, "frac": frac, "detail": detail}
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+
+def render_progress(snap: dict) -> str:
+    """進捗バーのHTML。frac が None の時は「処理中」の動くバーにする。"""
+    if not snap or not snap.get("title"):
+        return ""
+    frac = snap.get("frac")
+    pct = None if frac is None else max(0, min(100, int(float(frac) * 100)))
+    fill_cls = "tt-prog-fill" + (" tt-prog-indeterminate" if pct is None else "")
+    width = 100 if pct is None else pct
+    pct_text = "" if pct is None else f"{pct}%"
+    esc = html_lib.escape
+    return (
+        '<div class="tt-prog">'
+        f'<div class="tt-prog-head"><b>{esc(snap["title"])}</b><span>{pct_text}</span></div>'
+        f'<div class="tt-prog-track"><div class="{fill_cls}" style="width:{width}%"></div></div>'
+        f'<div class="tt-prog-detail">{esc(snap.get("detail", ""))}</div>'
+        '</div>'
+    )
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or seconds != seconds or seconds < 0:
+        return "計算中"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}秒"
+    if seconds < 3600:
+        return f"{seconds // 60}分{seconds % 60:02d}秒"
+    return f"{seconds // 3600}時間{(seconds % 3600) // 60:02d}分"
+
+
+def _report_tqdm(bar, tracker: ProgressTracker, total_steps: int):
+    """TrainTrainのtqdmの状態を、画面用の進捗に変換する。"""
+    n, total = int(bar.n), bar.total
+    if not total:
+        return
+    if int(total) == int(total_steps):          # 本番の学習ループ
+        info = bar.format_dict
+        rate = info.get("rate")
+        remain = (total - n) / rate if rate else None
+        desc = getattr(bar, "desc", "") or ""
+        parts = [f"{min(n, total)} / {total} step"]
+        m = re.search(r"Epoch: (\d+)", desc)
+        if m:
+            parts.append(f"Epoch {m.group(1)}")
+        m = re.search(r"Loss EMA \* 1000: ([0-9.]+)", desc)
+        if m:
+            parts.append(f"Loss {m.group(1)}")
+        parts.append(f"経過 {format_duration(info.get('elapsed'))}")
+        parts.append(f"残り約 {format_duration(remain)}")
+        tracker.set("学習中", min(1.0, n / total), " ・ ".join(parts))
+    else:                                        # 学習前の画像のlatent化など
+        tracker.set("学習の準備中（画像の前処理）", min(1.0, n / total), f"{n} / {total} 枚")
+
+
+@contextlib.contextmanager
+def hook_training_progress(train_module, tracker: ProgressTracker, total_steps: int):
+    """学習の間だけ train.py の tqdm を「進捗を記録する版」に差し替える。
+
+    train.py 本体は書き換えない（TrainTrain本家の更新を取り込みやすくするため）。
+    元のtqdmの動作（コンソール表示）はそのまま残る。
+    """
+    base = getattr(train_module, "tqdm", None)
+    if base is None:
+        yield
+        return
+
+    class TrackedTqdm(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._tt_report()
+
+        def update(self, n=1):
+            result = super().update(n)
+            self._tt_report()
+            return result
+
+        def _tt_report(self):
+            try:
+                _report_tqdm(self, tracker, total_steps)
+            except Exception:
+                pass          # 進捗表示の失敗で学習を止めない
+
+    train_module.tqdm = TrackedTqdm
+    try:
+        yield
+    finally:
+        train_module.tqdm = base
+
+
+def iter_with_progress(fn: Callable[[], object], tracker: ProgressTracker, interval: float = 0.8):
+    """fn を別スレッドで実行し、終わるまで進捗のスナップショットを yield し続ける。
+
+    使い方: result = yield from iter_with_progress(...)  /  または next() で受け取る。
+    fn が例外を投げた場合は、ここで再送出する。
+    """
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:      # noqa: BLE001  スレッドの例外を呼び出し側へ運ぶ
+            box["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        yield tracker.snapshot()
+        thread.join(interval)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 # ---------------------------------------------------------------------------
@@ -1359,14 +1496,6 @@ def build_easy_tab(
         except (TypeError, ValueError):
             return factory(*args, **kwargs)
 
-    # 進捗バー（古いGradioには無い）
-    progress_default = gr.Progress() if hasattr(gr, "Progress") else None
-
-    def make_progress(p):
-        if p is None:
-            return None
-        return lambda frac, desc="": p(frac, desc=desc)
-
     css = """
     .tt-easy-wrap { max-width: 1100px; margin: 0 auto; }
     .tt-easy-title { font-size: 30px; font-weight: 700; margin: 2px 0 0 0; }
@@ -1380,25 +1509,51 @@ def build_easy_tab(
     .tt-easy-step { font-size: 18px; font-weight: 700; }
     .tt-easy-note { opacity: 0.72; font-size: 0.92em; }
     .tt-easy-primary button, button.tt-easy-primary { min-height: 56px; font-size: 17px; font-weight: 700; }
+    .tt-prog { border: 1px solid var(--border-color-primary); border-radius: 12px; padding: 12px 16px; margin: 6px 0; }
+    .tt-prog-head { display: flex; justify-content: space-between; font-size: 15px; margin-bottom: 8px; }
+    .tt-prog-track { height: 12px; border-radius: 6px; background: var(--background-fill-secondary); overflow: hidden; }
+    .tt-prog-fill { height: 100%; border-radius: 6px; background: var(--color-accent, #f97316); transition: width .5s ease; }
+    .tt-prog-indeterminate { width: 40% !important; animation: tt-prog-slide 1.4s ease-in-out infinite; }
+    @keyframes tt-prog-slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+    .tt-prog-detail { margin-top: 8px; opacity: 0.75; font-size: 0.92em; }
     """
 
     preset_labels = [f"{k}｜{v['short']}" for k, v in PRESETS.items()]
 
     # ---- イベントハンドラ ---------------------------------------------------
+    # 進捗は標準のgr.Progressを使わず、専用のHTMLバー1つだけに出す。
+    # （gr.Progressは出力先のコンポーネントごとにバーを描くため、3重に表示されてしまう）
+    NO = gr.update()
+
     def _run_prep(flag, files, folder_path, dataset_name, preset_label, trigger,
-                  general_threshold, character_threshold, manual_keep, manual_remove,
-                  auto_th, progress):
+                  general_threshold, character_threshold, manual_keep, manual_remove, auto_th):
         preset_name = preset_key_from_label(preset_label)
-        try:
-            res = prepare_dataset(
+        tracker = ProgressTracker()
+        tracker.set("準備中", None, "画像を集めています")
+
+        def job():
+            return prepare_dataset(
                 files, folder_path, dataset_name, preset_name, trigger,
                 general_threshold, character_threshold, manual_keep, manual_remove,
-                bool(auto_th), progress=make_progress(progress),
+                bool(auto_th),
+                progress=lambda frac, desc="": tracker.set("準備中", frac, desc),
             )
+
+        # 前回の結果を消して、進捗だけを見せる
+        yield ("", "", None, NO, NO, NO, NO, NO, NO, "0", render_progress(tracker.snapshot()))
+
+        gen = iter_with_progress(job, tracker)
+        res = None
+        try:
+            while True:
+                snap = next(gen)
+                yield (NO, NO, NO, NO, NO, NO, NO, NO, NO, "0", render_progress(snap))
+        except StopIteration as stop:
+            res = stop.value
         except Exception as e:
             msg = f"### ❌ 準備に失敗しました\n\n{_friendly_error(e)}"
-            keep = gr.update()
-            return (msg, "", keep, keep, keep, keep, keep, keep, keep, "0")
+            yield (msg, "", NO, NO, NO, NO, NO, NO, NO, "0", "")
+            return
 
         st = res["stats"]
         lines = [
@@ -1407,51 +1562,61 @@ def build_easy_tab(
             f"- 使う画像: **{st['images_used']}枚**"
             + (f"（{len(st['excluded'])}枚は自動で除外）" if st["excluded"] else ""),
             f"- 種類: **{preset_name}**",
-            f"- トリガーワード: `{res['trigger']}` ← 画像を生成する時、プロンプトに入れます",
-            f"- おすすめ学習step: 約 **{res['auto_steps']}**",
         ]
+        if res["trigger"]:
+            lines.append(f"- トリガーワード: `{res['trigger']}` ← 画像を生成する時、プロンプトに入れます")
+        lines.append(f"- おすすめ学習step: 約 **{res['auto_steps']}**")
         if flag:
-            lines += ["", "▶ 続けて学習を開始します。進行状況はWebUIのコンソール(ログ)に表示されます。"]
+            lines += ["", "▶ 続けて学習を開始します。"]
         else:
             lines += ["", "内容を確認して、よければ下の「準備済みデータで学習だけ実行」を押してください。"]
-        return (
+        yield (
             "\n".join(lines), res["checkup"], res["gallery"], res["tag_rows"],
             res["image_rows"], res["stats_json"], res["zip_path"], res["prepared_dir"],
-            gr.update(value=res["auto_steps"]), "1" if flag else "0",
+            gr.update(value=res["auto_steps"]), "1" if flag else "0", "",
         )
 
-    def _prep_only(files, folder_path, dataset_name, preset_label, trigger,
-                   general_threshold, character_threshold, manual_keep, manual_remove,
-                   auto_th, progress=progress_default):
-        return _run_prep(False, files, folder_path, dataset_name, preset_label, trigger,
-                         general_threshold, character_threshold, manual_keep, manual_remove,
-                         auto_th, progress)
+    def _prep_only(*args):
+        yield from _run_prep(False, *args)
 
-    def _prep_and_train(files, folder_path, dataset_name, preset_label, trigger,
-                        general_threshold, character_threshold, manual_keep, manual_remove,
-                        auto_th, progress=progress_default):
-        return _run_prep(True, files, folder_path, dataset_name, preset_label, trigger,
-                         general_threshold, character_threshold, manual_keep, manual_remove,
-                         auto_th, progress)
+    def _prep_and_train(*args):
+        yield from _run_prep(True, *args)
 
     def _train(prepared_dir, trigger, dataset_name, output_name, preset_label,
                size_choice, steps, model, vae, te):
+        # 出力: [進捗バー, 結果, 停止ボタン, 停止メモ]
+        tracker = ProgressTracker()
+        tracker.set("学習の準備中", None, "モデルを読み込んでいます（数十秒〜数分かかります）")
+        yield (render_progress(tracker.snapshot()), "", gr.update(visible=True), "")
+
+        def job():
+            with hook_training_progress(train_module, tracker, int(steps)):
+                return start_training(
+                    train_module, trainer_module, prepared_dir,
+                    resolve_trigger(trigger, dataset_name),
+                    (output_name or "").strip() or dataset_name,
+                    preset_key_from_label(preset_label),
+                    resolve_image_size(size_choice, model),
+                    int(steps), model, vae, te,
+                )
+
+        gen = iter_with_progress(job, tracker)
         try:
-            return start_training(
-                train_module, trainer_module, prepared_dir,
-                resolve_trigger(trigger, dataset_name),
-                (output_name or "").strip() or dataset_name,
-                preset_key_from_label(preset_label),
-                resolve_image_size(size_choice, model),
-                int(steps), model, vae, te,
-            )
+            while True:
+                snap = next(gen)
+                yield (render_progress(snap), NO, NO, NO)
+        except StopIteration as stop:
+            message = stop.value
         except Exception as e:
-            return f"### ❌ 学習に失敗しました\n\n{_friendly_error(e)}"
+            message = f"### ❌ 学習に失敗しました\n\n{_friendly_error(e)}"
+        # 学習が終わったら進捗バーと停止ボタンを隠す
+        yield ("", message, gr.update(visible=False), "")
 
     def _train_if_pending(pending, *args):
         if pending != "1":
-            return gr.update()
-        return _train(*args)
+            yield (NO, NO, NO, NO)
+            return
+        yield from _train(*args)
 
     def _stop():
         try:
@@ -1507,22 +1672,24 @@ def build_easy_tab(
             run_prep = gr.Button("📦 準備だけ実行（タグ付け・チェックまで）",
                                  elem_classes=["tt-easy-primary"])
 
+        prep_progress = gr.HTML()
+        train_progress = gr.HTML()
+        with gr.Row():
+            # 学習中だけ表示する（開始時に表示、終了時に非表示にする）
+            stop_btn = gr.Button("⏹ 学習を止めて、ここまでを保存", variant="stop", visible=False)
+        stop_note = gr.Markdown()
         status = gr.Markdown()
         checkup = gr.Markdown()
         gallery = mk(gr.Gallery, label="学習用データのプレビュー（画像と、学習に使うタグ）",
                      optional={"columns": 4, "height": "auto"})
         train_result = gr.Markdown()
 
-        with gr.Row():
-            stop_btn = gr.Button("⏹ 学習を止めて、ここまでを保存")
-            stop_note = gr.Markdown()
-
         with gr.Accordion("詳細設定（通常は変更不要）", open=False):
             with gr.Row():
                 dataset_name = gr.Textbox(label="データセット名（半角英数字がおすすめ）", value="my_lora")
                 trigger = gr.Textbox(
-                    label="トリガーワード（空欄なら自動で決めます）", value="",
-                    placeholder="例: elora_mychar",
+                    label="トリガーワード（基本は不要。空欄ならなし）", value="",
+                    placeholder="使う場合だけ入力。例: mychar",
                 )
                 output_name = gr.Textbox(label="出力LoRA名（空欄ならデータセット名）", value="")
             with gr.Row():
@@ -1579,12 +1746,17 @@ def build_easy_tab(
                        general_threshold, character_threshold, manual_keep, manual_remove,
                        auto_threshold]
         prep_outputs = [status, checkup, gallery, tag_table, image_table, stats,
-                        zip_file, prepared_dir, steps, pending]
+                        zip_file, prepared_dir, steps, pending, prep_progress]
         train_inputs = [prepared_dir, trigger, dataset_name, output_name, preset,
                         image_size, steps, model, vae, te]
 
-        run_prep.click(_prep_only, prep_inputs, prep_outputs)
-        run_all.click(_prep_and_train, prep_inputs, prep_outputs).then(
-            _train_if_pending, [pending] + train_inputs, [train_result])
-        start.click(_train, train_inputs, [train_result])
-        stop_btn.click(_stop, None, [stop_note])
+        train_outputs = [train_progress, train_result, stop_btn, stop_note]
+        # show_progress="hidden": 標準の進捗表示は使わない（専用の進捗バーに一本化）
+        hidden = {"show_progress": "hidden"}
+
+        run_prep.click(_prep_only, prep_inputs, prep_outputs, **hidden)
+        run_all.click(_prep_and_train, prep_inputs, prep_outputs, **hidden).then(
+            _train_if_pending, [pending] + train_inputs, train_outputs, **hidden)
+        start.click(_train, train_inputs, train_outputs, **hidden)
+        # 停止は学習中でもすぐ受け付ける（キューを通さない）
+        stop_btn.click(_stop, None, [stop_note], queue=False, **hidden)

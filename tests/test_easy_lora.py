@@ -237,8 +237,10 @@ class TestDecisions(unittest.TestCase):
 
     def test_trigger_and_steps(self):
         self.assertEqual(E.resolve_trigger("  myword ", "x"), "myword")
-        self.assertEqual(E.resolve_trigger("", "My Char 01"), "elora_mychar01")
-        self.assertTrue(E.resolve_trigger("", "あいう").startswith("elora_"))
+        # トリガーワードは基本的に不要: 空欄ならそのまま「なし」
+        self.assertEqual(E.resolve_trigger("", "My Char 01"), "")
+        self.assertEqual(E.resolve_trigger(None, "あいう"), "")
+        self.assertEqual(E.resolve_trigger("   ", "x"), "")
         self.assertEqual(E.auto_steps(3, "キャラクター"), 400)
         self.assertEqual(E.auto_steps(20, "キャラクター"), 1000)
         self.assertEqual(E.auto_steps(500, "キャラクター"), 1800)
@@ -313,7 +315,6 @@ class TestPrepare(unittest.TestCase):
         # キャプション
         caps = {p.stem: p.read_text(encoding="utf-8") for p in prepared.glob("*.txt")}
         self.assertTrue(all("_" not in c for c in caps.values()), "アンダースコアは空白にする")
-        self.assertTrue(all(res["trigger"] not in c for c in caps.values()), "トリガーはtxtに書かない")
         joined = "\n".join(caps.values())
         for must_be_gone in ("blue hair", "blue eyes", "long hair", "school uniform",
                              "hatsune miku", "masterpiece", "highres", "1girl, 1girl"):
@@ -321,7 +322,7 @@ class TestPrepare(unittest.TestCase):
         for must_stay in ("1girl", "solo", "smile", "looking at viewer", "ponytail",
                           "watermark", "simple background", "zzz unknown thing"):
             self.assertIn(must_stay, joined)
-        self.assertEqual(res["trigger"], "elora_testset")
+        self.assertEqual(res["trigger"], "", "トリガーワードは既定でなし")
 
         # 監査用ファイル
         for f in ("summary.json", "tag_decisions.csv", "excluded.csv", "review.csv"):
@@ -345,6 +346,12 @@ class TestPrepare(unittest.TestCase):
         leaked = [x for x in set(os.listdir(tempfile.gettempdir())) - self.tmp_before
                   if x.startswith("traintrain_easy_")]
         self.assertEqual(leaked, [])
+
+    def test_explicit_trigger_is_returned_but_not_written_to_txt(self):
+        res = self.run_prepare(trigger=" mychar ")
+        self.assertEqual(res["trigger"], "mychar")
+        prepared = Path(res["prepared_dir"])
+        self.assertTrue(all("mychar" not in p.read_text(encoding="utf-8") for p in prepared.glob("*.txt")))
 
     def test_rerun_keeps_one_backup(self):
         self.run_prepare()
@@ -512,6 +519,25 @@ class TestTrainIntegration(unittest.TestCase):
                                 "キャラクター", 1024, 800, "model.safetensors", "None", "None")
         self.assertIn("<lora:mychar_2:1>", msg2)
 
+    def test_usage_message_without_trigger(self):
+        class FakeTrain:
+            @staticmethod
+            def train(*args):
+                idx = E._config_index(self_stub.all_configs)["save_lora_name"] + 5
+                Path(self_dir, args[idx] + ".safetensors").write_bytes(b"x")
+                return "Trained"
+        self_stub, self_dir = self.stub, self.tmp
+        prepared = Path(self.tmp) / "prepared"
+        prepared.mkdir()
+        msg = E.start_training(FakeTrain, self.stub, str(prepared), "", "plain",
+                               "キャラクター", 512, 400, "m.safetensors", "None", "None")
+        self.assertIn("トリガーワードなし", msg)
+        self.assertNotIn("`` を入れて", msg)
+
+    def test_empty_trigger_is_passed_through(self):
+        vals = self.values(trigger="")
+        self.assertEqual(self.get(vals, "lora_trigger_word"), "")
+
     def test_start_training_guards(self):
         msg = E.start_training(None, self.stub, "/nonexistent", "t", "n", "キャラクター", 512, 400, "m", "", "")
         self.assertIn("先に", msg)
@@ -524,6 +550,89 @@ class TestTrainIntegration(unittest.TestCase):
         self.assertEqual(E.guess_image_size("anything-v5.safetensors [abc]"), 512)
         self.assertEqual(E.resolve_image_size("768", "x"), 768)
         self.assertEqual(E.resolve_image_size("自動", "sdxl_base"), 1024)
+
+
+# ---------------------------------------------------------------------------
+# 進捗表示
+# ---------------------------------------------------------------------------
+
+class TestProgress(unittest.TestCase):
+    def test_render(self):
+        self.assertEqual(E.render_progress({}), "")
+        html = E.render_progress({"title": "学習中", "frac": 0.426, "detail": "a<b"})
+        self.assertIn("42%", html)
+        self.assertIn("width:42%", html)
+        self.assertIn("a&lt;b", html, "HTMLはエスケープする")
+        self.assertIn("tt-prog-indeterminate", E.render_progress({"title": "x", "frac": None, "detail": ""}))
+        self.assertIn("width:100%", E.render_progress({"title": "x", "frac": 7.0, "detail": ""}))
+
+    def test_format_duration(self):
+        self.assertEqual(E.format_duration(None), "計算中")
+        self.assertEqual(E.format_duration(45), "45秒")
+        self.assertEqual(E.format_duration(125), "2分05秒")
+        self.assertEqual(E.format_duration(3700), "1時間01分")
+
+    def test_tqdm_hook_reports_both_phases_and_restores(self):
+        import time as _time
+        from tqdm import tqdm as real_tqdm
+        mod = types.SimpleNamespace(tqdm=real_tqdm)
+        tracker = E.ProgressTracker()
+        seen = []
+        with E.hook_training_progress(mod, tracker, total_steps=40):
+            self.assertIsNot(mod.tqdm, real_tqdm)
+            # 1) 画像の前処理 (total=画像枚数)
+            bar = mod.tqdm(total=5, file=io.StringIO())
+            bar.update(2)
+            seen.append(tracker.snapshot())
+            # 2) 本番の学習ループ (total=step数)
+            pbar = mod.tqdm(range(40), file=io.StringIO())
+            pbar.set_description("Loss EMA * 1000: 12.3456, Current LR: 1.00e-04, Epoch: 3")
+            for _ in range(10):
+                _time.sleep(0.01)
+                pbar.update(1)
+            seen.append(tracker.snapshot())
+        self.assertIs(mod.tqdm, real_tqdm, "終了後は元のtqdmに戻す")
+        self.assertIn("前処理", seen[0]["title"])
+        self.assertAlmostEqual(seen[0]["frac"], 0.4)
+        self.assertEqual(seen[1]["title"], "学習中")
+        self.assertAlmostEqual(seen[1]["frac"], 0.25)
+        for must in ("10 / 40 step", "Epoch 3", "Loss 12.3456", "残り約"):
+            self.assertIn(must, seen[1]["detail"])
+
+    def test_hook_restores_even_on_error_and_tolerates_missing_tqdm(self):
+        from tqdm import tqdm as real_tqdm
+        mod = types.SimpleNamespace(tqdm=real_tqdm)
+        with self.assertRaises(ValueError):
+            with E.hook_training_progress(mod, E.ProgressTracker(), 10):
+                raise ValueError("x")
+        self.assertIs(mod.tqdm, real_tqdm)
+        with E.hook_training_progress(types.SimpleNamespace(), E.ProgressTracker(), 10):
+            pass  # tqdm属性が無くても落ちない
+
+    def test_iter_with_progress(self):
+        import time as _time
+        tracker = E.ProgressTracker()
+
+        def job():
+            for i in range(3):
+                tracker.set("t", i / 3, str(i))
+                _time.sleep(0.15)
+            return "RESULT"
+
+        gen = E.iter_with_progress(job, tracker, interval=0.05)
+        snaps = []
+        try:
+            while True:
+                snaps.append(next(gen))
+        except StopIteration as stop:
+            result = stop.value
+        self.assertEqual(result, "RESULT")
+        self.assertGreaterEqual(len(snaps), 3)
+
+        def bad():
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            list(E.iter_with_progress(bad, E.ProgressTracker(), interval=0.01))
 
 
 # ---------------------------------------------------------------------------
