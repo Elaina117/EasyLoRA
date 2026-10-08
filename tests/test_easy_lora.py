@@ -509,15 +509,18 @@ class TestTrainIntegration(unittest.TestCase):
         self_stub, self_dir = self.stub, self.tmp
         prepared = Path(self.tmp) / "prepared"
         prepared.mkdir()
-        msg = E.start_training(FakeTrain, self.stub, str(prepared), "elora_x", "mychar",
-                               "キャラクター", 1024, 800, "model.safetensors", "None", "None")
+        msg, path = E.start_training(FakeTrain, self.stub, str(prepared), "elora_x", "mychar",
+                                     "キャラクター", 1024, 800, "model.safetensors", "None", "None")
         self.assertEqual(calls[0][:5], (False, "LoRA", "model.safetensors", "None", "None"))
         self.assertIn("✅", msg)
         self.assertIn("<lora:mychar:1>", msg)
+        self.assertTrue(path.endswith("mychar.safetensors") and os.path.isfile(path))
         # 2回目は同名にならない
-        msg2 = E.start_training(FakeTrain, self.stub, str(prepared), "elora_x", "mychar",
-                                "キャラクター", 1024, 800, "model.safetensors", "None", "None")
+        msg2, path2 = E.start_training(FakeTrain, self.stub, str(prepared), "elora_x", "mychar",
+                                       "キャラクター", 1024, 800, "model.safetensors", "None", "None")
         self.assertIn("<lora:mychar_2:1>", msg2)
+        self.assertTrue(path2.endswith("mychar_2.safetensors"))
+
 
     def test_usage_message_without_trigger(self):
         class FakeTrain:
@@ -529,8 +532,8 @@ class TestTrainIntegration(unittest.TestCase):
         self_stub, self_dir = self.stub, self.tmp
         prepared = Path(self.tmp) / "prepared"
         prepared.mkdir()
-        msg = E.start_training(FakeTrain, self.stub, str(prepared), "", "plain",
-                               "キャラクター", 512, 400, "m.safetensors", "None", "None")
+        msg, _ = E.start_training(FakeTrain, self.stub, str(prepared), "", "plain",
+                                  "キャラクター", 512, 400, "m.safetensors", "None", "None")
         self.assertIn("トリガーワードなし", msg)
         self.assertNotIn("`` を入れて", msg)
 
@@ -539,10 +542,49 @@ class TestTrainIntegration(unittest.TestCase):
         self.assertEqual(self.get(vals, "lora_trigger_word"), "")
 
     def test_start_training_guards(self):
-        msg = E.start_training(None, self.stub, "/nonexistent", "t", "n", "キャラクター", 512, 400, "m", "", "")
+        msg, path = E.start_training(None, self.stub, "/nonexistent", "t", "n", "キャラクター", 512, 400, "m", "", "")
         self.assertIn("先に", msg)
-        msg = E.start_training(None, self.stub, self.tmp, "t", "n", "キャラクター", 512, 400, "", "", "")
+        self.assertIsNone(path)
+        msg, path = E.start_training(None, self.stub, self.tmp, "t", "n", "キャラクター", 512, 400, "", "", "")
         self.assertIn("モデル", msg)
+        self.assertIsNone(path)
+
+    def _train_returning(self, result, make_file=None):
+        stub, tmp = self.stub, self.tmp
+
+        class FakeTrain:
+            @staticmethod
+            def train(*args):
+                if make_file:
+                    Path(tmp, make_file).write_bytes(b"x")
+                return result.replace("{dir}", tmp)
+        prepared = Path(self.tmp) / "prepared"
+        prepared.mkdir(exist_ok=True)
+        return E.start_training(FakeTrain, stub, str(prepared), "", "n", "キャラクター",
+                                512, 400, "m.safetensors", "None", "None")
+
+    def test_stop_and_save_uses_the_renamed_file(self):
+        # 途中で止めて保存すると、TrainTrainは「名前_12steps.safetensors」で保存する
+        msg, path = self._train_returning(
+            "Stopped. Successfully created to {dir}/n_12steps.safetensors", make_file="n_12steps.safetensors")
+        self.assertTrue(path.endswith("n_12steps.safetensors"))
+        self.assertIn("⏹", msg)
+        self.assertIn("<lora:n_12steps:1>", msg)
+        self.assertIn("途中で止めて", msg)
+        self.assertNotIn("Stopped", msg)
+        self.assertNotIn("Successfully", msg)
+
+    def test_error_result_is_japanese_and_has_no_download(self):
+        msg, path = self._train_returning("Error: CUDA out of memory. Tried to allocate 2.00 GiB")
+        self.assertIsNone(path)
+        self.assertIn("エラーが発生しました", msg)
+        self.assertIn("学習解像度を下げて", msg)
+
+    def test_no_data_message(self):
+        msg, path = self._train_returning("No data!")
+        self.assertIsNone(path)
+        self.assertIn("学習に使える画像がありません", msg)
+        self.assertNotIn("No data", msg)
 
     def test_guess_image_size(self):
         self.assertEqual(E.guess_image_size("animagineXL_v3.safetensors"), 1024)
@@ -550,6 +592,310 @@ class TestTrainIntegration(unittest.TestCase):
         self.assertEqual(E.guess_image_size("anything-v5.safetensors [abc]"), 512)
         self.assertEqual(E.resolve_image_size("768", "x"), 768)
         self.assertEqual(E.resolve_image_size("自動", "sdxl_base"), 1024)
+
+
+# ---------------------------------------------------------------------------
+# メッセージの日本語化・保存ファイル探索
+# ---------------------------------------------------------------------------
+
+class TestTranslate(unittest.TestCase):
+    CASES = {
+        "File exist!": "同じ名前のLoRAファイルが既にあります",
+        "No Model Selected.": "モデルが選択されていません",
+        "Stopped": "学習を途中で停止しました（保存はしていません）",
+        "Successfully created to /x/a.safetensors": "LoRAを保存しました: /x/a.safetensors",
+        "Stopped. Successfully created to /x/a_9steps.safetensors":
+            "学習を途中で止めて、ここまでの結果を保存しました: /x/a_9steps.safetensors",
+        "anima can only be trained from inside Forge Neo": "anima はForge Neoの中でのみ学習できます",
+        "Test mode": "テストモードのため、学習は行いませんでした",
+    }
+
+    def test_known_messages(self):
+        for en, ja in self.CASES.items():
+            self.assertEqual(E.translate_train_message(en), ja)
+
+    def test_every_message_in_train_py_is_covered(self):
+        """train.py が返す文言を実際に抜き出して、日本語化漏れがないことを確認する。"""
+        import re
+        src = (ROOT / "trainer" / "train.py").read_text(encoding="utf-8")
+        found = set(re.findall(r'return "([^"]+)"', src)) | set(re.findall(r'result = "([^"]+)"', src))
+        found = {x for x in found if x and not x.startswith(". ")}
+        self.assertGreaterEqual(len(found), 6)
+        untranslated = [m for m in found if E.translate_train_message(m) == m]
+        self.assertEqual(untranslated, [], f"日本語化されていないメッセージ: {untranslated}")
+
+    def test_unknown_messages_are_kept_and_multiline(self):
+        self.assertEqual(E.translate_train_message("Something new"), "Something new")
+        out = E.translate_train_message("File exist!\nNo data!")
+        self.assertEqual(out.splitlines()[0], "同じ名前のLoRAファイルが既にあります")
+        self.assertIn("学習に使える画像", out.splitlines()[1])
+
+    def test_find_saved_lora(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Path(d, "x.safetensors"); a.write_bytes(b"1")
+            b = Path(d, "x_30steps.safetensors"); b.write_bytes(b"1")
+            t0 = __import__("time").time() - 1
+            self.assertEqual(E.find_saved_lora(f"Successfully created to {b}", d, "x", t0), str(b))
+            self.assertEqual(E.find_saved_lora(f"Stopped. Successfully created to {a}", d, "x", t0), str(a))
+            self.assertIsNotNone(E.find_saved_lora("Done", d, "x", t0))     # メッセージが無くても探す
+            self.assertIsNone(E.find_saved_lora("Done", d, "nope", t0))
+            os.utime(a, (1, 1)); os.utime(b, (1, 1))                           # 古いファイルは対象外
+            self.assertIsNone(E.find_saved_lora("Done", d, "x", t0))
+
+    def test_prepare_download_copies_to_temp(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d, "my.safetensors"); src.write_bytes(b"abc")
+            out = E.prepare_download(str(src))
+            self.assertEqual(Path(out).read_bytes(), b"abc")
+            self.assertNotEqual(os.path.dirname(out), d)
+
+
+# ---------------------------------------------------------------------------
+# メモリ解放
+# ---------------------------------------------------------------------------
+
+class TestFreeMemory(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: sys.modules.get(k) for k in ("modules", "modules.sd_models", "modules.devices",
+                                                       "backend", "backend.memory_management")}
+        self.calls = []
+        calls = self.calls
+        sd = types.ModuleType("modules.sd_models")
+        sd.unload_model_weights = lambda *a, **k: calls.append("unload_model_weights")
+        sd.checkpoints_loaded = {"cached": object()}
+        dev = types.ModuleType("modules.devices")
+        dev.torch_gc = lambda: calls.append("torch_gc")
+        mods = types.ModuleType("modules"); mods.sd_models = sd; mods.devices = dev
+        be = types.ModuleType("backend")
+        mm = types.ModuleType("backend.memory_management")
+        mm.unload_all_models = lambda: calls.append("unload_all_models")
+        mm.soft_empty_cache = lambda: calls.append("soft_empty_cache")
+        be.memory_management = mm
+        sys.modules.update({"modules": mods, "modules.sd_models": sd, "modules.devices": dev,
+                            "backend": be, "backend.memory_management": mm})
+        self.sd = sd
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def test_unloads_everything_when_enabled(self):
+        r = E.free_memory(True)
+        for must in ("unload_model_weights", "unload_all_models", "soft_empty_cache", "torch_gc"):
+            self.assertIn(must, self.calls)
+        self.assertEqual(self.sd.checkpoints_loaded, {}, "A1111のチェックポイントキャッシュも空にする")
+        self.assertIn("メモリ使用量", r["note"])
+        self.assertRegex(r["note"], r"(GB|MB) → ")
+
+    def test_does_not_touch_webui_when_disabled(self):
+        E.free_memory(False)
+        self.assertEqual(self.calls, [])
+
+    def test_survives_broken_webui_api(self):
+        self.sd.unload_model_weights = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        r = E.free_memory(True)         # 例外を外に出さない
+        self.assertIn("note", r)
+
+    def test_actually_returns_memory(self):
+        import gc
+        big = np.ones((200, 1024, 1024), dtype=np.uint8)      # 約200MB
+        before = E._memory_snapshot().get("rss")
+        del big
+        gc.collect()
+        r = E.free_memory(False)
+        if before is not None:
+            self.assertLess(r["after"], before, "確保したメモリがOSに返っている")
+
+
+# ---------------------------------------------------------------------------
+# モデルのダウンロード
+# ---------------------------------------------------------------------------
+
+def make_safetensors(n_floats=1000) -> bytes:
+    data = np.arange(n_floats, dtype=np.float32).tobytes()
+    header = json.dumps({"w": {"dtype": "F32", "shape": [n_floats], "data_offsets": [0, len(data)]}}).encode()
+    return len(header).to_bytes(8, "little") + header + data
+
+
+class FileServer:
+    """Range/リダイレクト/途中切断を再現できる、テスト用のHTTPサーバー。"""
+
+    def __init__(self, files):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        outer = self
+        self.files, self.requests, self.truncate_first, self.delay = files, [], False, 0
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                outer.requests.append((self.path, self.headers.get("Range")))
+                if self.path.startswith("/redirect/"):
+                    self.send_response(302)
+                    self.send_header("Location", "/files/" + self.path[len("/redirect/"):])
+                    self.end_headers()
+                    return
+                name = self.path[len("/files/"):] if self.path.startswith("/files/") else None
+                if name not in outer.files:
+                    self.send_response(404); self.end_headers(); return
+                body = outer.files[name]
+                start, rng = 0, self.headers.get("Range")
+                if rng:
+                    start = int(rng.split("=")[1].split("-")[0])
+                    if start >= len(body):
+                        self.send_response(416); self.end_headers(); return
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+                else:
+                    self.send_response(200)
+                chunk = body[start:]
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                if outer.truncate_first and not rng:      # 最初のリクエストだけ途中で切る
+                    outer.truncate_first = False
+                    self.wfile.write(chunk[: len(chunk) // 2])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                if outer.delay:                            # ゆっくり送る（進捗表示の確認用）
+                    import time as _t
+                    for i in range(0, len(chunk), 65536):
+                        self.wfile.write(chunk[i:i + 65536])
+                        self.wfile.flush()
+                        _t.sleep(outer.delay)
+                else:
+                    self.wfile.write(chunk)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def close(self):
+        self.server.shutdown()
+
+
+class TestDownload(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="easylora_dl_"))
+        self.blob = make_safetensors(50000)               # 約200KB
+        self.srv = FileServer({"m.safetensors": self.blob, "bad.safetensors": self.blob[:-100]})
+
+    def tearDown(self):
+        self.srv.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_validate_safetensors(self):
+        ok = self.tmp / "ok.safetensors"; ok.write_bytes(self.blob)
+        self.assertTrue(E.is_valid_safetensors(ok))
+        cut = self.tmp / "cut.safetensors"; cut.write_bytes(self.blob[:-1])
+        self.assertFalse(E.is_valid_safetensors(cut), "1バイトでも足りなければ不正")
+        junk = self.tmp / "junk.safetensors"; junk.write_bytes(b"<html>Not Found</html>" * 10)
+        self.assertFalse(E.is_valid_safetensors(junk))
+        self.assertFalse(E.is_valid_safetensors(self.tmp / "none.safetensors"))
+
+    def test_download_with_redirect_and_progress(self):
+        calls = []
+        dest = E.download_file(self.srv.url("/redirect/m.safetensors"), self.tmp / "out" / "m.safetensors",
+                               lambda d, t, s: calls.append((d, t)), chunk=16 * 1024)
+        self.assertEqual(Path(dest).read_bytes(), self.blob)
+        self.assertFalse((self.tmp / "out" / "m.safetensors.part").exists(), ".partは残さない")
+        self.assertEqual(calls[-1], (len(self.blob), len(self.blob)))
+
+    def test_resumes_from_part_file(self):
+        part = self.tmp / "m.safetensors.part"
+        part.write_bytes(self.blob[:70000])
+        E.download_file(self.srv.url("/files/m.safetensors"), self.tmp / "m.safetensors")
+        self.assertEqual((self.tmp / "m.safetensors").read_bytes(), self.blob)
+        self.assertEqual(self.srv.requests[0][1], "bytes=70000-", "続きから取得している")
+
+    def test_retries_when_connection_drops(self):
+        self.srv.truncate_first = True
+        E.download_file(self.srv.url("/files/m.safetensors"), self.tmp / "m.safetensors")
+        self.assertEqual((self.tmp / "m.safetensors").read_bytes(), self.blob)
+        self.assertGreaterEqual(len(self.srv.requests), 2)
+
+    def test_404_is_a_readable_error(self):
+        with self.assertRaises(RuntimeError) as cm:
+            E.download_file(self.srv.url("/files/missing.safetensors"), self.tmp / "x.safetensors")
+        self.assertIn("見つかりません", str(cm.exception))
+        self.assertFalse((self.tmp / "x.safetensors").exists())
+
+    def test_find_installed_model_ignores_naming_differences(self):
+        spec = E.CatalogModel("l", "r", "split_files/diffusion_models/anima-base-v1.0.safetensors", 4.2)
+        ckpt = self.tmp / "ckpt"; ckpt.mkdir()
+        orig = E.checkpoint_dir
+        E.checkpoint_dir = lambda: ckpt
+        try:
+            self.assertIsNone(E.find_installed_model(spec))
+            (ckpt / "anima_baseV10.safetensors").write_bytes(b"truncated")     # 壊れたファイルは対象外
+            self.assertIsNone(E.find_installed_model(spec))
+            (ckpt / "anima_baseV10.safetensors").write_bytes(self.blob)
+            self.assertEqual(E.find_installed_model(spec).name, "anima_baseV10.safetensors")
+        finally:
+            E.checkpoint_dir = orig
+
+    def test_catalog_matches_requested_models(self):
+        by_file = {m.filename: m for m in E.MODEL_CATALOG}
+        self.assertEqual(by_file["Illustrious-XL-v2.0.safetensors"].url,
+                         "https://huggingface.co/OnomaAIResearch/Illustrious-XL-v2.0/resolve/main/Illustrious-XL-v2.0.safetensors")
+        self.assertEqual(by_file["anima-base-v1.0.safetensors"].url,
+                         "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors")
+        self.assertTrue(by_file["anima-base-v1.0.safetensors"].needs_modules)
+
+    def _fake_catalog(self, needs_modules=False):
+        spec = E.CatalogModel("★ Fake（テスト）", "x/y", "dir/m.safetensors", 0.0, needs_modules)
+        spec.__class__ = type("S", (E.CatalogModel,), {"url": property(lambda s: self.srv.url("/redirect/m.safetensors"))})
+        return spec
+
+    def test_resolve_model_downloads_once_then_reuses(self):
+        spec = self._fake_catalog()
+        ckpt = self.tmp / "ckpt"; ckpt.mkdir()
+        saved = (dict(E.CATALOG_BY_LABEL), E.checkpoint_dir)
+        E.CATALOG_BY_LABEL[spec.label] = spec
+        E.checkpoint_dir = lambda: ckpt
+        try:
+            progress = []
+            name = E.resolve_model(spec.label, lambda d, t, s: progress.append(d))
+            self.assertEqual(Path(name), ckpt / "m.safetensors")
+            self.assertEqual((ckpt / "m.safetensors").read_bytes(), self.blob)
+            self.assertTrue(progress)
+            n = len(self.srv.requests)
+            self.assertEqual(Path(E.resolve_model(spec.label)), ckpt / "m.safetensors")
+            self.assertEqual(len(self.srv.requests), n, "2回目はダウンロードしない")
+            self.assertEqual(E.resolve_model("plain.safetensors [abc]"), "plain.safetensors [abc]")
+        finally:
+            E.CATALOG_BY_LABEL.clear(); E.CATALOG_BY_LABEL.update(saved[0]); E.checkpoint_dir = saved[1]
+
+    def test_modules_check_for_split_models(self):
+        spec = E.CatalogModel("★ Anima base v1.0（x）", "r", "p/anima.safetensors", 4.2, needs_modules=True)
+        saved = {k: sys.modules.get(k) for k in ("modules", "modules.shared")}
+        try:
+            shared = types.ModuleType("modules.shared")
+            shared.opts = types.SimpleNamespace(forge_additional_modules=[])
+            mods = types.ModuleType("modules"); mods.shared = shared
+            sys.modules.update({"modules": mods, "modules.shared": shared})
+            with self.assertRaises(RuntimeError) as cm:
+                E.check_webui_modules_for(spec)
+            self.assertIn("VAE", str(cm.exception))
+            self.assertIn("Anima base v1.0", str(cm.exception))
+            shared.opts.forge_additional_modules = ["/x/vae.safetensors", "/x/te.safetensors"]
+            E.check_webui_modules_for(spec)                       # 選択済みなら通る
+            del shared.opts.forge_additional_modules              # Forge以外(属性なし)は確認しない
+            E.check_webui_modules_for(spec)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +1005,32 @@ class TestUI(unittest.TestCase):
         import gradio as gr
         with gr.Blocks():
             E.build_easy_tab(types.SimpleNamespace(), load_real_configs(), gradio_module=gr)
+
+    def test_catalog_models_are_in_dropdown(self):
+        import gradio as gr
+        with gr.Blocks() as demo:
+            E.build_easy_tab(types.SimpleNamespace(), load_real_configs(),
+                             model_choices=["local.safetensors"], default_model="local.safetensors",
+                             gradio_module=gr)
+        dropdowns = [b for b in demo.blocks.values() if type(b).__name__ == "Dropdown"
+                     and b.label == "モデル（チェックポイント）"]
+        self.assertEqual(len(dropdowns), 1)
+        values = [c[0] if isinstance(c, (tuple, list)) else c for c in dropdowns[0].choices]
+        self.assertEqual(values[:2], [m.label for m in E.MODEL_CATALOG], "★付きの候補が先頭")
+        self.assertIn("local.safetensors", values)
+        self.assertEqual(dropdowns[0].value, "local.safetensors", "既定は今使っているモデル")
+
+    def test_no_local_models_defaults_to_first_catalog_model(self):
+        import gradio as gr
+        with gr.Blocks() as demo:
+            E.build_easy_tab(types.SimpleNamespace(), load_real_configs(), gradio_module=gr)
+        dd = [b for b in demo.blocks.values() if type(b).__name__ == "Dropdown"
+              and b.label == "モデル（チェックポイント）"][0]
+        self.assertEqual(dd.value, E.MODEL_CATALOG[0].label)
+
+    def test_image_size_guess_works_for_catalog_labels(self):
+        for m in E.MODEL_CATALOG:
+            self.assertEqual(E.guess_image_size(m.label), 1024)
 
     def test_preset_labels(self):
         for k, v in E.PRESETS.items():

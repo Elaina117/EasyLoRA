@@ -44,6 +44,8 @@
   - 準備: 画像チェック → タグ付け(n/枚数) → 整理
   - 学習: 準備中（モデル読み込み・画像の前処理）→ 学習中（step / Epoch / Loss / 経過 / 残り時間）
 - **学習を止めて保存するボタン**は学習中だけ表示
+- 学習が終わると **「⬇ LoRAをダウンロード」ボタン**が出る（途中で止めて保存した場合は、その保存ファイル）
+- TrainTrainの英語メッセージ（`Stopped` / `File exist!` / `No data!` / `Error: ...` など）はすべて日本語に変換
 - 準備済みデータセットのZIPをダウンロード可能
 - エラーは画面に日本語で表示（原因と対処つき）
 
@@ -88,6 +90,47 @@ easy_datasets/
 ```
 トリガーワードは `.txt` には書かない（TrainTrainの `dataset.py` が先頭に自動で付けるため）。
 
+## メモリ不足（Colabの強制終了）対策
+
+Colabはメモリを使い切ると、ログも出さずにプロセスを終了させる。WebUIで画像生成した後は
+モデルがRAM/VRAMに残っているため、**準備の前**と**学習の前**に次の順で解放する。
+
+1. `sd_models.unload_model_weights()`（Forge Neo / A1111。モデルのアンロードとキャッシュ解放）
+2. Forgeの `memory_management.unload_all_models()` と `soft_empty_cache()`、A1111の `devices.torch_gc()`
+3. `gc.collect()` ×3 と CUDAキャッシュの解放
+4. `malloc_trim(0)`（Pythonが握っている空きメモリをOSへ返す。Linux/Colab）
+
+- 解放前後のメモリ使用量を画面に表示する（例: `メモリ使用量 9.8GB → 3.2GB`）
+- 「詳細設定」のチェックボックスで無効化できる（既定はON）
+- 副作用: WebUIのモデルが外れるので、次の画像生成時に自動で再読み込みされる
+- 学習に使うモデルが大きい場合の読み込み時のピークは、TrainTrain側の処理なので変えていない
+- タグ付けのモデル（ONNX）は、使い終わったらすぐ解放する
+- 大きな画像の重複判定は1MBずつ読む（ファイル全体をメモリに載せない）
+
+## 学習に使うモデルの自動ダウンロード
+
+ドロップダウンの先頭に、**★付きの候補**を2つ追加した。
+
+| 候補 | ファイル | サイズ |
+|---|---|---|
+| ★ Illustrious-XL v2.0 | `OnomaAIResearch/Illustrious-XL-v2.0` の `Illustrious-XL-v2.0.safetensors` | 約6.9GB |
+| ★ Anima base v1.0 | `circlestone-labs/Anima` の `split_files/diffusion_models/anima-base-v1.0.safetensors` | 約4.2GB |
+
+- 学習を始める時に、モデルがWebUIのチェックポイントフォルダに**無ければ自動でダウンロード**する
+- 名前の表記ゆれは無視して既存ファイルを探す（`anima_baseV10.safetensors` と `anima-base-v1.0.safetensors` は同じ扱い）。
+  壊れた/途中のファイルは「ある」とみなさない
+- ダウンロードは**途中から再開**できる（切れても `.part` から続きを取得）。サイズが合わなければ再試行、
+  完了後に `.safetensors` のヘッダも検証する。ディスク容量が足りない時は事前にエラーにする
+- 進捗バーに `モデルをダウンロード中 69% 4.1GB / 6.9GB ・ 85MB/s ・ 残り約 33秒` と表示
+- ダウンロード後は、WebUIのチェックポイント一覧を更新してから学習に渡す
+- ログインが必要なモデルを追加する場合は、環境変数 `HF_TOKEN` を使う
+- 一覧は `trainer/easy_lora.py` の `MODEL_CATALOG` に足すだけで増やせる
+
+注意:
+- **Anima は分割配布**（本体のみ）なので、WebUI上部の「VAE / Text Encoder」で、Anima用のものを
+  選んでおく必要がある。未選択のまま実行すると、日本語のエラーで案内する（Forge Neoのみ確認可能）
+- ライセンスはモデルごとに異なる（Illustrious: creativeml-openrail-m、Anima: circlestone-labs-non-commercial-license）
+
 ## 進捗表示の仕組み
 
 - Gradio標準の進捗(`gr.Progress`)は**出力先のコンポーネントごとにバーを描く**ため、同じバーが複数出ていた。
@@ -115,13 +158,17 @@ model precision は **bf16が使えるGPUならbf16、無ければfp16**。
 python -m unittest tests.test_easy_lora -v
 ```
 
-WebUI・GPU・ネット接続なしで動く（WD14は決め打ちの偽タガーに差し替え）。38件。
+WebUI・GPU・ネット接続なしで動く（WD14は決め打ちの偽タガー、Hugging Faceは手元のHTTPサーバーに差し替え）。62件。
 
 - タグ分類、出現率ベースの選別、しきい値の自動調整
 - WD14前処理（BGR・0〜255）
 - 画像の除外・EXIF回転・ZIP展開（パストラバーサル対策つき）・一時フォルダの掃除
 - **`scripts/traintrain.py` の実物の設定定義**に対して、上書きキーがすべて存在することと、解像度・LoRA名が実際に入ることの確認
 - 進捗表示（tqdmの差し替えと復元、%・残り時間・ETAの計算、HTMLエスケープ）
+- TrainTrainのメッセージの日本語化（`train.py` が返す文言を実際に抜き出して、漏れがないことを確認）
+- 停止して保存した時の別名ファイル（`名前_12steps.safetensors`）の検出
+- メモリ解放（WebUI側のAPIを差し替えて、呼び出し順・例外耐性・実際にメモリが戻ること）
+- ダウンロード（リダイレクト・Range再開・途中切断の再試行・404・破損ファイル・表記ゆれ・2回目は再取得しない）
 - Gradio 3.41.2 / 4.44.1 の両方でタブの構築と各ボタンの処理を確認済み
 - 実際のGradioサーバーで、進捗が途中経過としてストリームされること・停止ボタンの表示/非表示を確認済み
 
@@ -133,6 +180,9 @@ WebUI・GPU・ネット接続なしで動く（WD14は決め打ちの偽タガ�
 - ONNX Runtime の CUDA 実行（失敗時はCPUに自動で切り替わる）
 - TrainTrain の実学習（引数の並びと設定名は実物の定義で検証済み）
 - Colab上のDriveフォルダ読み込み
+- Hugging Faceからの実ダウンロード（手元のHTTPサーバーでは検証済み。リダイレクト・Range再開も再現済み）
+- Forge Neoでの実際のメモリ削減量（Forge Neoのソースを読んで、解放に使うAPIが存在することは確認済み）
+- Animaの実学習（VAE / Text Encoderの選択チェックは、Forge Neoの設定名に依存）
 - 初期値（rank・step・学習率）で作ったLoRAの品質
 
 ## 今後の候補

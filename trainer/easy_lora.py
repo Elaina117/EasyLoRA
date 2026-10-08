@@ -587,7 +587,11 @@ def collect_input_images(files, folder_path: str | None) -> tuple[list[Path], Pa
         seen: set[str] = set()
         for p in collected:
             try:
-                digest = hashlib.sha1(p.read_bytes()).hexdigest()
+                h = hashlib.sha1()
+                with open(p, "rb") as f:                  # 1MBずつ読む（大きな画像でもメモリを食わない）
+                    for block in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(block)
+                digest = h.hexdigest()
             except Exception:
                 continue
             if digest not in seen:
@@ -864,6 +868,7 @@ def prepare_dataset(
     manual_remove_text: str = "",
     auto_threshold: bool = True,
     progress: Optional[Callable[[float, str], None]] = None,
+    free_mem: bool = False,
 ) -> dict:
     """画像の取り込み → チェック → WD14タグ付け → タグ選別 → データセット出力。"""
 
@@ -880,6 +885,11 @@ def prepare_dataset(
     trigger = resolve_trigger(trigger, dataset_name)
     manual_keep = _parse_tag_list(manual_keep_text)
     manual_remove = _parse_tag_list(manual_remove_text)
+
+    memory_note = ""
+    if free_mem:
+        report(0.01, "メモリを空けています（WebUIのモデルを解放中）")
+        memory_note = free_memory(True)["note"]
 
     report(0.02, "画像を集めています")
     sources, temp_root = collect_input_images(files, folder_path)
@@ -930,6 +940,7 @@ def prepare_dataset(
         provider = tagger.provider
         tagger.close()          # 学習の前にVRAMを空ける
         tagger = None
+        gc.collect()
 
         report(0.82, "タグを整理しています")
         threshold_used = float(general_threshold)
@@ -1066,6 +1077,7 @@ def prepare_dataset(
             "zip_path": zip_path,
             "image_count": n_used,
             "auto_steps": steps,
+            "memory_note": memory_note,
         }
     finally:
         if tagger is not None:
@@ -1116,6 +1128,440 @@ def build_checkup(stats: dict, preset_name: str) -> str:
     if "CUDA" not in stats["tagger_provider"] and n > 100:
         lines.append("ℹ️ タグ付けはCPUで動きました。枚数が多いと時間がかかります。")
     return "\n\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# メモリの解放
+# ---------------------------------------------------------------------------
+# Google Colab は、メモリを使い切るとログも出さずにプロセスを強制終了する。
+# WebUIで画像を生成した後は、モデルがメモリ(RAM/VRAM)に残っているので、
+# 準備・学習の前にできる限り空けておく。
+
+def _memory_snapshot() -> dict:
+    """このプロセスのメモリ使用量(RSS)と、マシン全体の空きメモリ。取得できなければ空の辞書。"""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return {
+            "rss": psutil.Process().memory_info().rss / 1024 ** 3,
+            "avail": vm.available / 1024 ** 3,
+            "total": vm.total / 1024 ** 3,
+        }
+    except Exception:
+        pass
+    try:                                    # psutil が無い環境（Linuxのみ）
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024
+        rss = 0
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    rss = int(line.split()[1]) * 1024
+        return {"rss": rss / 1024 ** 3, "avail": info["MemAvailable"] / 1024 ** 3,
+                "total": info["MemTotal"] / 1024 ** 3}
+    except Exception:
+        return {}
+
+
+def _fmt_gb(value: float) -> str:
+    return f"{value:.1f}GB" if value >= 1 else f"{value * 1024:.0f}MB"
+
+
+def free_memory(unload_webui_model: bool = True) -> dict:
+    """可能な限りメモリを空ける。失敗しても例外は出さず、できた範囲で続行する。
+
+    unload_webui_model=True の時は、WebUIが読み込んでいるモデルも解放する
+    （次に画像を生成する時に、WebUIが自動で読み込み直す）。
+    戻り値: {"before": GB, "after": GB, "avail": GB, "total": GB, "note": 画面用の説明}
+    """
+    before = _memory_snapshot()
+
+    if unload_webui_model:
+        try:
+            from modules import sd_models
+            unload = getattr(sd_models, "unload_model_weights", None)
+            if unload is not None:
+                unload()
+            cache = getattr(sd_models, "checkpoints_loaded", None)   # A1111のチェックポイントキャッシュ
+            if hasattr(cache, "clear"):
+                cache.clear()
+        except Exception as e:
+            print(f"[Easy LoRA] WebUIのモデル解放をスキップ: {type(e).__name__}: {e}")
+        try:
+            from backend import memory_management as mm              # Forge系
+            mm.unload_all_models()
+            mm.soft_empty_cache()
+        except Exception:
+            pass
+        try:
+            from modules import devices                              # A1111系
+            devices.torch_gc()
+        except Exception:
+            pass
+
+    for _ in range(3):
+        gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:                                    # glibcが保持している空きメモリをOSへ返す（Linux/Colab）
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+    after = _memory_snapshot()
+    note = ""
+    if before and after:
+        note = (f"メモリ使用量 {_fmt_gb(before['rss'])} → {_fmt_gb(after['rss'])}"
+                f"（マシンの空き {_fmt_gb(after['avail'])} / {_fmt_gb(after['total'])}）")
+        print(f"[Easy LoRA] {note}")
+    return {"before": before.get("rss"), "after": after.get("rss"),
+            "avail": after.get("avail"), "total": after.get("total"), "note": note}
+
+
+# ---------------------------------------------------------------------------
+# TrainTrain のメッセージを日本語にする
+# ---------------------------------------------------------------------------
+
+_TRAIN_MESSAGES = [
+    (re.compile(r"^Stopped\. Successfully created to (.+)$"),
+     lambda m: f"学習を途中で止めて、ここまでの結果を保存しました: {m.group(1)}"),
+    (re.compile(r"^Stopped$"), lambda m: "学習を途中で停止しました（保存はしていません）"),
+    (re.compile(r"^Successfully created to (.+)$"), lambda m: f"LoRAを保存しました: {m.group(1)}"),
+    (re.compile(r"^File exist!$"), lambda m: "同じ名前のLoRAファイルが既にあります"),
+    (re.compile(r"^No Model Selected\.?$"), lambda m: "モデルが選択されていません"),
+    (re.compile(r"^No data!?$"),
+     lambda m: "学習に使える画像がありません（画像が空、小さすぎる、または解像度の条件に合っていない可能性があります）"),
+    (re.compile(r"^Test mode$"), lambda m: "テストモードのため、学習は行いませんでした"),
+    (re.compile(r"^Not save copy$"), lambda m: "コピーは保存しませんでした"),
+    (re.compile(r"^Preset saved$"), lambda m: "プリセットを保存しました"),
+    (re.compile(r"^Added to Queue$"), lambda m: "キューに追加しました"),
+    (re.compile(r"^Duplicated LoRA name! Could not add to queue\.?$"),
+     lambda m: "同じ名前のLoRAが既にキューにあるため、追加できませんでした"),
+    (re.compile(r"^(.+) can only be trained from inside Forge Neo$"),
+     lambda m: f"{m.group(1)} はForge Neoの中でのみ学習できます"),
+]
+
+_ERROR_HINTS = [
+    (re.compile(r"out of memory|CUDA error: out of memory|OOM", re.I),
+     "GPUメモリ(VRAM)が足りませんでした。「詳細設定」で学習解像度を下げて、もう一度お試しください。"),
+    (re.compile(r"No such file|FileNotFoundError|not found", re.I),
+     "必要なファイルが見つかりませんでした。モデルやVAE・Text Encoderの指定を確認してください。"),
+]
+
+
+def translate_train_message(text: str) -> str:
+    """TrainTrainが返す英語のメッセージを日本語にする。未知のメッセージは原文のまま残す。"""
+    out_lines = []
+    for line in str(text or "").splitlines() or [""]:
+        s = line.strip()
+        translated = None
+        for pattern, fn in _TRAIN_MESSAGES:
+            m = pattern.match(s)
+            if m:
+                translated = fn(m)
+                break
+        if translated is None and s.startswith("Error:"):
+            detail = s[len("Error:"):].strip()
+            translated = f"エラーが発生しました: {detail}"
+            for pattern, hint in _ERROR_HINTS:
+                if pattern.search(detail):
+                    translated += f"\n{hint}"
+                    break
+        out_lines.append(translated if translated is not None else line)
+    return "\n".join(out_lines)
+
+
+def find_saved_lora(result: str, save_dir: Optional[str], name: str, started: float) -> Optional[str]:
+    """学習で保存されたLoRAのパスを探す。
+
+    完了時は「名前.safetensors」、途中で止めて保存した時は「名前_123steps.safetensors」になるので、
+    TrainTrainのメッセージ(Successfully created to ...)から取るのが確実。
+    """
+    m = re.search(r"Successfully created to (.+?\.safetensors)", str(result or ""))
+    if m and os.path.isfile(m.group(1).strip()):
+        return m.group(1).strip()
+    if save_dir and os.path.isdir(save_dir):
+        candidates = [
+            p for p in Path(save_dir).glob(f"{name}*.safetensors")
+            if p.stat().st_mtime >= started - 2
+        ]
+        if candidates:
+            return str(max(candidates, key=lambda p: p.stat().st_mtime))
+    return None
+
+
+def prepare_download(path: str) -> Optional[str]:
+    """ダウンロード用にコピーを作る。LoRAの保存先がGradioの配信範囲外でも確実に取れるようにする。"""
+    try:
+        out_dir = Path(tempfile.gettempdir()) / "easylora_download"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / Path(path).name
+        shutil.copy2(path, dst)
+        return str(dst)
+    except Exception as e:
+        print(f"[Easy LoRA] ダウンロード用コピーに失敗: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# モデルの自動ダウンロード
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CatalogModel:
+    label: str            # ドロップダウンに出す名前
+    repo: str             # Hugging Face のリポジトリ
+    path: str             # リポジトリ内のファイルパス
+    size_gb: float        # 目安（画面表示用。実際のサイズはダウンロード時に取得）
+    needs_modules: bool = False   # VAE/Text EncoderをWebUI側で選ぶ必要があるか（分割配布のモデル）
+
+    @property
+    def filename(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def url(self) -> str:
+        return f"https://huggingface.co/{self.repo}/resolve/main/{self.path}"
+
+
+MODEL_CATALOG = [
+    CatalogModel(
+        label="★ Illustrious-XL v2.0（約6.9GB・無ければ自動ダウンロード）",
+        repo="OnomaAIResearch/Illustrious-XL-v2.0",
+        path="Illustrious-XL-v2.0.safetensors",
+        size_gb=6.94,
+    ),
+    CatalogModel(
+        label="★ Anima base v1.0（約4.2GB・無ければ自動ダウンロード）",
+        repo="circlestone-labs/Anima",
+        path="split_files/diffusion_models/anima-base-v1.0.safetensors",
+        size_gb=4.18,
+        needs_modules=True,
+    ),
+]
+CATALOG_BY_LABEL = {m.label: m for m in MODEL_CATALOG}
+
+
+def _norm_stem(name: str) -> str:
+    """ファイル名の表記ゆれをなくす。anima_baseV10 と anima-base-v1.0 を同じとみなすため。"""
+    return re.sub(r"[^a-z0-9]", "", Path(name).stem.lower())
+
+
+def checkpoint_dir() -> Path:
+    """モデルを保存するフォルダ（WebUIのチェックポイントフォルダ）。"""
+    try:
+        from modules import sd_models
+        p = getattr(sd_models, "model_path", None)
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    try:
+        from modules import shared
+        p = getattr(shared.cmd_opts, "ckpt_dir", None)
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    p = _extension_root() / "models" / "checkpoints"
+    return p
+
+
+def find_installed_model(spec: CatalogModel) -> Optional[Path]:
+    """既にあるモデルを探す。名前の表記ゆれ(記号・大文字小文字)は無視する。"""
+    wanted = _norm_stem(spec.filename)
+    exts = {".safetensors", ".ckpt", ".sft"}
+    candidates: list[Path] = []
+    try:
+        from modules import sd_models
+        for info in list(getattr(sd_models, "checkpoints_list", {}).values()):
+            fn = getattr(info, "filename", None)
+            if fn:
+                candidates.append(Path(fn))
+    except Exception:
+        pass
+    root = checkpoint_dir()
+    if root.is_dir():
+        candidates.extend(p for p in root.rglob("*") if p.suffix.lower() in exts)
+    for p in candidates:
+        if p.suffix.lower() in exts and _norm_stem(p.name) == wanted and p.is_file():
+            if is_valid_safetensors(p):
+                return p
+    return None
+
+
+def is_valid_safetensors(path) -> bool:
+    """ヘッダだけを見て、途切れた/壊れたファイルを弾く（全体は読まないので速い）。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                return False
+            header_len = int.from_bytes(raw, "little")
+            if header_len <= 0 or header_len > 100 * 1024 * 1024 or 8 + header_len > size:
+                return False
+            header = json.loads(f.read(header_len))
+        end = 0
+        for k, v in header.items():
+            if k != "__metadata__":
+                end = max(end, v["data_offsets"][1])
+        return 8 + header_len + end <= size
+    except Exception:
+        return False
+
+
+def download_file(url: str, dest: Path, progress_cb: Optional[Callable[[int, int, float], None]] = None,
+                  retries: int = 5, chunk: int = 4 * 1024 * 1024) -> Path:
+    """URLをdestへ保存する。途中から再開でき、サイズが合わなければ再試行する。
+
+    - 保存中は dest + ".part" に書き、完了してから本来の名前に変える（途中のファイルを使わせない）
+    - 失敗しても .part は残すので、もう一度実行すると続きから再開する
+    progress_cb(取得済みバイト, 全体バイト(不明なら0), 速度バイト/秒)
+    """
+    import requests
+
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    headers_base = {"User-Agent": "EasyLoRA/1.0"}
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        headers_base["Authorization"] = f"Bearer {token}"
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            have = part.stat().st_size if part.exists() else 0
+            headers = dict(headers_base)
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            with requests.get(url, headers=headers, stream=True, timeout=(15, 60),
+                              allow_redirects=True) as r:
+                if r.status_code in (401, 403):
+                    raise RuntimeError(
+                        "このモデルはログインが必要か、アクセスが許可されていません。"
+                        "環境変数 HF_TOKEN にHugging Faceのトークンを設定してください。")
+                if r.status_code == 404:
+                    raise RuntimeError(f"モデルのURLが見つかりません（404）: {url}")
+                if r.status_code == 416:               # 既に全部取得済み
+                    total = have
+                else:
+                    r.raise_for_status()
+                    if r.status_code == 200 and have:  # 再開を断られた → 最初から
+                        have = 0
+                        part.unlink()
+                    if r.status_code == 206:
+                        m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
+                        total = int(m.group(1)) if m else have + int(r.headers.get("Content-Length", 0))
+                    else:
+                        total = int(r.headers.get("Content-Length", 0))
+                    try:
+                        free = shutil.disk_usage(dest.parent).free
+                        if total and total - have > free * 0.98:
+                            raise RuntimeError(
+                                f"ディスクの空き容量が足りません（必要 約{(total - have) / 1024 ** 3:.1f}GB / "
+                                f"空き {free / 1024 ** 3:.1f}GB）。")
+                    except OSError:
+                        pass
+
+                    done, t0, t_last, speed = have, time.time(), 0.0, 0.0
+                    with open(part, "ab" if have else "wb") as f:
+                        for block in r.iter_content(chunk_size=chunk):
+                            if not block:
+                                continue
+                            f.write(block)
+                            done += len(block)
+                            now = time.time()
+                            if progress_cb and now - t_last >= 0.5:
+                                speed = (done - have) / max(now - t0, 1e-6)
+                                progress_cb(done, total, speed)
+                                t_last = now
+            size = part.stat().st_size
+            if total and size != total:
+                raise IOError(f"ダウンロードが途中で切れました（{size}/{total}バイト）")
+            os.replace(part, dest)
+            if progress_cb:
+                progress_cb(size, size, 0.0)
+            return dest
+        except RuntimeError:
+            raise
+        except Exception as e:                          # ネットワークの一時的な失敗は再試行
+            last_error = e
+            print(f"[Easy LoRA] ダウンロード失敗({attempt}/{retries}): {type(e).__name__}: {e}")
+            time.sleep(min(2 * attempt, 10))
+    raise RuntimeError(
+        "モデルのダウンロードに失敗しました。インターネット接続を確認して、もう一度実行してください"
+        f"（途中まで保存してあるので、続きから再開します）。詳細: {type(last_error).__name__}: {last_error}")
+
+
+def refresh_webui_checkpoints():
+    """ダウンロードしたモデルをWebUIの一覧に反映する。"""
+    try:
+        from modules import sd_models
+        sd_models.list_models()
+    except Exception as e:
+        print(f"[Easy LoRA] チェックポイント一覧の更新をスキップ: {type(e).__name__}: {e}")
+
+
+def checkpoint_name_for(path: Path) -> str:
+    """TrainTrainに渡すモデル名。WebUIの一覧にあればそのタイトル、無ければファイルのパス。"""
+    try:
+        from modules import sd_models
+        target = os.path.abspath(str(path))
+        for info in sd_models.checkpoints_list.values():
+            if os.path.abspath(getattr(info, "filename", "")) == target:
+                return info.title
+    except Exception:
+        pass
+    return str(path)
+
+
+def check_webui_modules_for(spec: CatalogModel):
+    """分割配布のモデル(Anima等)は、VAEとText EncoderをWebUIで選んでいないと読み込めない。"""
+    if not spec.needs_modules:
+        return
+    try:
+        from modules import shared
+        modules = getattr(shared.opts, "forge_additional_modules", None)
+    except Exception:
+        return                              # Forge以外では確認できないので何もしない
+    if modules is not None and len(modules) == 0:
+        raise RuntimeError(
+            f"{spec.label.replace('★ ', '').split('（')[0]} は、本体のほかに VAE と Text Encoder が必要です。"
+            "WebUI上部の「VAE / Text Encoder」で、このモデル用のVAEとText Encoderを選んでから、"
+            "もう一度実行してください。")
+
+
+def resolve_model(model_value: str, progress_cb: Optional[Callable[[int, int, float], None]] = None) -> str:
+    """ドロップダウンの値を、TrainTrainに渡せるモデル名にする。
+
+    ★付きの候補は、既にあればそれを使い、無ければダウンロードする。通常のモデルはそのまま返す。
+    """
+    spec = CATALOG_BY_LABEL.get(model_value)
+    if spec is None:
+        return model_value
+    installed = find_installed_model(spec)
+    if installed is None:
+        dest = checkpoint_dir() / spec.filename
+        download_file(spec.url, dest, progress_cb)
+        if not is_valid_safetensors(dest):
+            dest.unlink(missing_ok=True)
+            raise RuntimeError("ダウンロードしたファイルが壊れていました。もう一度実行してください。")
+        installed = dest
+        refresh_webui_checkpoints()
+    check_webui_modules_for(spec)
+    return checkpoint_name_for(installed)
 
 
 # ---------------------------------------------------------------------------
@@ -1265,13 +1711,16 @@ def start_training(
     model: str,
     vae: str,
     te: str,
-) -> str:
+    free_mem: bool = False,
+) -> tuple[str, Optional[str]]:
+    """学習を実行する。戻り値は (画面に出すメッセージ, 保存されたLoRAのパス or None)。"""
     if not prepared_dir or not os.path.isdir(prepared_dir):
-        return "❌ 先に「準備」を実行してください（学習用データが見つかりません）。"
+        return "❌ 先に「準備」を実行してください（学習用データが見つかりません）。", None
     if not model:
-        return "❌ モデルを選択してください。"
+        return "❌ モデルを選択してください。", None
 
     name = _unique_lora_name(trainer_module, output_name or "my_lora")
+    started = time.time()
 
     def run(lora_name: str) -> str:
         values = build_train_values(
@@ -1280,7 +1729,10 @@ def start_training(
         )
         return str(train_module.train(False, "LoRA", model, vae or "None", te or "None", *values))
 
-    _free_gpu()
+    if free_mem:
+        free_memory(True)
+    else:
+        _free_gpu()
     try:
         result = run(name)
         if "File exist" in result:
@@ -1290,23 +1742,30 @@ def start_training(
         import traceback
         traceback.print_exc()
         return (f"❌ 学習を開始できませんでした: {type(e).__name__}: {e}\n\n"
-                "VRAM不足の場合は、解像度(詳細設定)を下げるか、より軽いモデルを選んでください。")
+                "GPUメモリ(VRAM)が足りない場合は、「詳細設定」で学習解像度を下げるか、"
+                "より軽いモデルを選んでください。"), None
 
     save_dir = getattr(trainer_module, "lora_dir", None)
-    saved = save_dir and os.path.exists(os.path.join(save_dir, f"{name}.safetensors"))
-    if saved:
+    path = find_saved_lora(result, save_dir, name, started)
+    translated = translate_train_message(result)
+    if path:
+        stem = Path(path).stem
+        stopped = str(result).lstrip().startswith("Stopped")
+        title = "### ⏹ 学習を途中で止めて、ここまでを保存しました" if stopped else "### ✅ 学習完了"
         if (trigger or "").strip():
-            usage = f"プロンプトに `{trigger}` を入れて、`<lora:{name}:1>` を追加"
+            usage = f"プロンプトに `{trigger}` を入れて、`<lora:{stem}:1>` を追加"
         else:
-            usage = f"プロンプトに `<lora:{name}:1>` を追加するだけで使えます（トリガーワードなし）"
-        return (
-            f"### ✅ 学習完了\n\n"
-            f"- 出力: `{name}.safetensors`\n"
+            usage = f"プロンプトに `<lora:{stem}:1>` を追加するだけで使えます（トリガーワードなし）"
+        message = (
+            f"{title}\n\n"
+            f"- 出力: `{Path(path).name}`\n"
             f"- 使い方: {usage}\n"
-            f"- 効きすぎ/弱すぎる時は `:1` を `:0.6` や `:1.2` に変えて調整\n\n"
-            f"（TrainTrainからのメッセージ: {result}）"
+            f"- 効きすぎ/弱すぎる時は `:1` を `:0.6` や `:1.2` に変えて調整\n"
+            f"- 下の「ダウンロード」ボタンで、このファイルを手元に保存できます\n\n"
+            f"{translated}"
         )
-    return f"### 学習が終了しました\n\nTrainTrainからのメッセージ: {result}"
+        return message, path
+    return f"### 学習は完了しませんでした\n\n{translated}", None
 
 
 # ---------------------------------------------------------------------------
@@ -1479,13 +1938,20 @@ def build_easy_tab(
     if gr is None:
         import gradio as gr
 
-    model_choices = list(model_choices or [])
+    local_models = list(model_choices or [])
     vae_choices = list(vae_choices or ["None"])
     te_choices = list(te_choices or ["None"])
-    if default_model and default_model not in model_choices:
-        model_choices = [default_model] + model_choices
-    first_model = default_model if default_model in model_choices else (
-        model_choices[0] if model_choices else None)
+    if default_model and default_model not in local_models:
+        local_models = [default_model] + local_models
+    # ★付きの候補（無ければ学習開始時に自動でダウンロード）を先頭に並べる
+    catalog_labels = [m.label for m in MODEL_CATALOG]
+    model_choices = catalog_labels + [m for m in local_models if m not in catalog_labels]
+    if default_model in local_models:
+        first_model = default_model
+    elif local_models:
+        first_model = local_models[0]
+    else:
+        first_model = catalog_labels[0]          # モデルが1つも無くても、そのまま始められる
 
     def mk(factory, *args, optional=None, **kwargs):
         """Gradioのバージョン差を吸収する。optional の引数は、そのバージョンが
@@ -1526,7 +1992,8 @@ def build_easy_tab(
     NO = gr.update()
 
     def _run_prep(flag, files, folder_path, dataset_name, preset_label, trigger,
-                  general_threshold, character_threshold, manual_keep, manual_remove, auto_th):
+                  general_threshold, character_threshold, manual_keep, manual_remove, auto_th,
+                  free_mem):
         preset_name = preset_key_from_label(preset_label)
         tracker = ProgressTracker()
         tracker.set("準備中", None, "画像を集めています")
@@ -1537,6 +2004,7 @@ def build_easy_tab(
                 general_threshold, character_threshold, manual_keep, manual_remove,
                 bool(auto_th),
                 progress=lambda frac, desc="": tracker.set("準備中", frac, desc),
+                free_mem=bool(free_mem),
             )
 
         # 前回の結果を消して、進捗だけを見せる
@@ -1566,6 +2034,8 @@ def build_easy_tab(
         if res["trigger"]:
             lines.append(f"- トリガーワード: `{res['trigger']}` ← 画像を生成する時、プロンプトに入れます")
         lines.append(f"- おすすめ学習step: 約 **{res['auto_steps']}**")
+        if res.get("memory_note"):
+            lines.append(f"- メモリを空けました: {res['memory_note']}")
         if flag:
             lines += ["", "▶ 続けて学習を開始します。"]
         else:
@@ -1583,13 +2053,34 @@ def build_easy_tab(
         yield from _run_prep(True, *args)
 
     def _train(prepared_dir, trigger, dataset_name, output_name, preset_label,
-               size_choice, steps, model, vae, te):
-        # 出力: [進捗バー, 結果, 停止ボタン, 停止メモ]
+               size_choice, steps, model, vae, te, free_mem):
+        # 出力: [進捗バー, 結果, 停止ボタン, 停止メモ, ダウンロードボタン]
+        hide_download = gr.update(visible=False)
         tracker = ProgressTracker()
-        tracker.set("学習の準備中", None, "モデルを読み込んでいます（数十秒〜数分かかります）")
-        yield (render_progress(tracker.snapshot()), "", gr.update(visible=True), "")
+        tracker.set("学習の準備中", None, "準備しています")
+        yield (render_progress(tracker.snapshot()), "", gr.update(visible=True), "", hide_download)
+
+        def on_download(done, total, speed):
+            frac = (done / total) if total else None
+            remain = ((total - done) / speed) if (total and speed) else None
+            gb = 1024 ** 3
+            detail = (f"{_fmt_gb(done / gb)} / {_fmt_gb(total / gb)}" if total else _fmt_gb(done / gb))
+            if speed:
+                detail += f" ・ {speed / 1024 ** 2:.1f} MB/s ・ 残り約 {format_duration(remain)}"
+            tracker.set("モデルをダウンロード中", frac, detail)
 
         def job():
+            # 1) モデル（★付きで無ければダウンロード）
+            spec = CATALOG_BY_LABEL.get(model)
+            if spec is not None:
+                tracker.set("モデルを確認中", None, spec.filename)
+            model_name = resolve_model(model, on_download)
+            # 2) メモリを空ける（WebUIのモデルなど）
+            tracker.set("メモリを空けています", None, "WebUIのモデルをメモリから解放しています")
+            mem = free_memory(bool(free_mem))
+            tracker.set("学習の準備中", None,
+                        mem["note"] or "モデルを読み込んでいます（数十秒〜数分かかります）")
+            # 3) 学習
             with hook_training_progress(train_module, tracker, int(steps)):
                 return start_training(
                     train_module, trainer_module, prepared_dir,
@@ -1597,24 +2088,31 @@ def build_easy_tab(
                     (output_name or "").strip() or dataset_name,
                     preset_key_from_label(preset_label),
                     resolve_image_size(size_choice, model),
-                    int(steps), model, vae, te,
+                    int(steps), model_name, vae, te,
                 )
 
         gen = iter_with_progress(job, tracker)
+        saved_path = None
         try:
             while True:
                 snap = next(gen)
-                yield (render_progress(snap), NO, NO, NO)
+                yield (render_progress(snap), NO, NO, NO, NO)
         except StopIteration as stop:
-            message = stop.value
+            message, saved_path = stop.value
         except Exception as e:
             message = f"### ❌ 学習に失敗しました\n\n{_friendly_error(e)}"
-        # 学習が終わったら進捗バーと停止ボタンを隠す
-        yield ("", message, gr.update(visible=False), "")
+        # 学習が終わったら進捗バーと停止ボタンを隠し、完成したLoRAのダウンロードボタンを出す
+        download = hide_download
+        if saved_path:
+            copy = prepare_download(saved_path)
+            if copy:
+                download = gr.update(value=copy, visible=True,
+                                     label=f"⬇ LoRAをダウンロード（{Path(saved_path).name}）")
+        yield ("", message, gr.update(visible=False), "", download)
 
     def _train_if_pending(pending, *args):
         if pending != "1":
-            yield (NO, NO, NO, NO)
+            yield (NO, NO, NO, NO, NO)
             return
         yield from _train(*args)
 
@@ -1665,6 +2163,10 @@ def build_easy_tab(
                             elem_classes=["tt-easy-note"])
             model = gr.Dropdown(choices=model_choices, value=first_model,
                                 label="モデル（チェックポイント）", allow_custom_value=True)
+            gr.Markdown(
+                "★付きは、モデルが無ければ**学習を始める時に自動でダウンロード**します（Hugging Face）。"
+                "Animaは本体のほかに、WebUI上部の「VAE / Text Encoder」で対応するものを選んでおく必要があります。",
+                elem_classes=["tt-easy-note"])
 
         with gr.Row():
             run_all = gr.Button("🚀 おまかせで学習まで実行", variant="primary",
@@ -1683,6 +2185,10 @@ def build_easy_tab(
         gallery = mk(gr.Gallery, label="学習用データのプレビュー（画像と、学習に使うタグ）",
                      optional={"columns": 4, "height": "auto"})
         train_result = gr.Markdown()
+        if hasattr(gr, "DownloadButton"):
+            lora_download = gr.DownloadButton("⬇ LoRAをダウンロード", variant="primary", visible=False)
+        else:                                    # 古いGradioにはDownloadButtonが無い
+            lora_download = gr.File(label="完成したLoRA（クリックでダウンロード）", interactive=False, visible=False)
 
         with gr.Accordion("詳細設定（通常は変更不要）", open=False):
             with gr.Row():
@@ -1695,6 +2201,9 @@ def build_easy_tab(
             with gr.Row():
                 auto_threshold = gr.Checkbox(
                     label="タグが少ない時、WD14のしきい値を自動で下げる", value=True)
+                free_mem = gr.Checkbox(
+                    label="準備・学習の前に、WebUIのモデルをメモリから解放する（推奨。次の画像生成時に自動で再読み込み）",
+                    value=True)
             with gr.Row():
                 general_threshold = gr.Slider(
                     0.10, 0.70, value=WD_DEFAULT_GENERAL_THRESHOLD, step=0.01,
@@ -1744,13 +2253,13 @@ def build_easy_tab(
 
         prep_inputs = [files, folder_path, dataset_name, preset, trigger,
                        general_threshold, character_threshold, manual_keep, manual_remove,
-                       auto_threshold]
+                       auto_threshold, free_mem]
         prep_outputs = [status, checkup, gallery, tag_table, image_table, stats,
                         zip_file, prepared_dir, steps, pending, prep_progress]
         train_inputs = [prepared_dir, trigger, dataset_name, output_name, preset,
-                        image_size, steps, model, vae, te]
+                        image_size, steps, model, vae, te, free_mem]
 
-        train_outputs = [train_progress, train_result, stop_btn, stop_note]
+        train_outputs = [train_progress, train_result, stop_btn, stop_note, lora_download]
         # show_progress="hidden": 標準の進捗表示は使わない（専用の進捗バーに一本化）
         hidden = {"show_progress": "hidden"}
 
