@@ -2384,6 +2384,10 @@ def build_easy_tab(
     .tt-prog-indeterminate { width: 40% !important; animation: tt-prog-slide 1.4s ease-in-out infinite; }
     @keyframes tt-prog-slide { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
     .tt-prog-detail { margin-top: 8px; opacity: 0.75; font-size: 0.92em; }
+    /* Gradio 6.5.x applies opacity:.2 to pending HTML/Markdown nodes even when
+       show_progress="hidden". Polling every second makes live progress blink.
+       Keep only these frequently updated outputs fully opaque. */
+    .tt-no-flicker .pending, .tt-no-flicker.pending { opacity: 1 !important; }
     """
 
     preset_labels = [f"{k}｜{v['short']}" for k, v in PRESETS.items()]
@@ -2523,17 +2527,17 @@ def build_easy_tab(
             run_prep = gr.Button("📦 準備だけ実行（タグ付け・チェックまで）",
                                  elem_classes=["tt-easy-primary"])
 
-        prep_progress = gr.HTML()
-        train_progress = gr.HTML()
+        prep_progress = gr.HTML(elem_classes=["tt-no-flicker"])
+        train_progress = gr.HTML(elem_classes=["tt-no-flicker"])
         with gr.Row():
             # 学習中だけ表示する（開始時に表示、終了時に非表示にする）
             stop_btn = gr.Button("⏹ 学習を止めて、ここまでを保存", variant="stop", visible=False)
         stop_note = gr.Markdown()
-        status = gr.Markdown()
-        checkup = gr.Markdown()
+        status = gr.Markdown(elem_classes=["tt-no-flicker"])
+        checkup = gr.Markdown(elem_classes=["tt-no-flicker"])
         gallery = mk(gr.Gallery, label="学習用データのプレビュー（画像と、学習に使うタグ）",
                      optional={"columns": 4, "height": "auto"})
-        train_result = gr.Markdown()
+        train_result = gr.Markdown(elem_classes=["tt-no-flicker"])
         if hasattr(gr, "DownloadButton"):
             lora_download = gr.DownloadButton("⬇ LoRAをダウンロード", variant="primary", visible=False)
         else:                                    # 古いGradioにはDownloadButtonが無い

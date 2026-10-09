@@ -1483,6 +1483,28 @@ class TestUI(unittest.TestCase):
                         default_model="a.safetensors", gradio_module=gr)
         self.assertGreater(len(demo.fns), 5)
 
+    def test_live_outputs_disable_gradio_pending_fade(self):
+        """Timer polling must not dim the progress/status components between updates."""
+        import gradio as gr
+        with gr.Blocks() as demo:
+            E.build_easy_tab(types.SimpleNamespace(), load_real_configs(), gradio_module=gr)
+
+        live_outputs = [
+            block for block in demo.blocks.values()
+            if "tt-no-flicker" in (getattr(block, "elem_classes", None) or [])
+        ]
+        self.assertEqual(len(live_outputs), 5, "2 progress HTML + 3 dynamically polled Markdown outputs")
+
+        style_blocks = [
+            getattr(block, "value", "") for block in demo.blocks.values()
+            if type(block).__name__ == "HTML"
+        ]
+        self.assertTrue(
+            any(".tt-no-flicker .pending" in str(value) and "opacity: 1 !important" in str(value)
+                for value in style_blocks),
+            "Gradio's pending opacity animation must be disabled only for live outputs",
+        )
+
     def test_build_tab_without_models(self):
         import gradio as gr
         with gr.Blocks():
