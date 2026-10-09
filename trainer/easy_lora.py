@@ -2399,8 +2399,12 @@ def build_easy_tab(
     NO = gr.update()
     use_timer = hasattr(gr, "Timer")
 
+    def _result_versions(seen: dict) -> dict:
+        """結果表示用タイマーが最後に反映した版数だけを保持する。"""
+        return {key: seen.get(key, 0) for key in ("prep_version", "train_version")}
+
     def pack(up: dict, seen: dict) -> tuple:
-        """compose_ui の結果を、Gradioの出力（poll_outputsの並び）にする。"""
+        """開始ボタン用。開始時は画面全体をまとめて更新してよい。"""
         def val(key):
             return NO if up[key] is KEEP else up[key]
         stop = NO if up["stop_visible"] is KEEP else gr.update(visible=bool(up["stop_visible"]))
@@ -2411,12 +2415,74 @@ def build_easy_tab(
                   val("zip_file"), val("prepared_dir"), steps_u, val("train_result"),
                   stop, download, seen]
         if use_timer:
-            values.append(gr.update(active=bool(up["active"])))
+            # 画面全体を更新した直後の版数を、結果専用タイマーにも同期する。
+            values.extend([
+                _result_versions(seen),
+                gr.update(active=bool(up["active"])),
+                gr.update(active=False),
+            ])
         return tuple(values)
 
     def poll(seen):
+        """Timer がない古い Gradio 向けの互換ポーリング。"""
         up, new_seen = compose_ui(runner.snapshot(), seen)
         return pack(up, new_seen)
+
+    def poll_progress(seen, result_seen):
+        """毎秒更新するのは進捗バーだけ。結果コンポーネントは出力対象にしない。
+
+        Gradio は値が変わらない出力に gr.update() を返しても、そのコンポーネントを
+        イベントの出力対象として扱うバージョンがある。プレビューや設定欄をこの
+        1秒タイマーの出力リストから外し、不要な pending / レイアウト変化を避ける。
+        """
+        snap = runner.snapshot()
+        seen = dict(seen or {})
+        result_seen = dict(result_seen or {})
+
+        bar = render_progress(snap["progress"]) if snap["running"] else ""
+        prep_html = bar if snap["stage"] == "prep" else ""
+        train_html = bar if snap["stage"] == "train" else ""
+        prep_value = prep_html if prep_html != seen.get("prep_html") else NO
+        train_value = train_html if train_html != seen.get("train_html") else NO
+        seen["prep_html"] = prep_html
+        seen["train_html"] = train_html
+
+        # 結果の版数が変わった時だけ、専用タイマーを一度起動する。
+        # requested の印で、結果タイマーが処理するまで毎秒再起動するのを防ぐ。
+        request_results = False
+        for key in ("prep_version", "train_version"):
+            current = snap[key]
+            requested_key = f"_requested_{key}"
+            if current != result_seen.get(key, 0) and current != seen.get(requested_key):
+                seen[requested_key] = current
+                request_results = True
+
+        result_timer_update = gr.update(active=True) if request_results else NO
+        if snap["running"]:
+            seen["_timer_was_active"] = True
+            timer_update = NO
+        else:
+            timer_update = (gr.update(active=False)
+                            if seen.get("_timer_was_active", True) else NO)
+            seen["_timer_was_active"] = False
+
+        return prep_value, train_value, seen, result_timer_update, timer_update
+
+    def poll_results(result_seen):
+        """版数が変わった時だけ結果表示を更新し、結果タイマーを停止する。"""
+        up, new_seen = compose_ui(runner.snapshot(), result_seen)
+
+        def val(key):
+            return NO if up[key] is KEEP else up[key]
+
+        stop = NO if up["stop_visible"] is KEEP else gr.update(visible=bool(up["stop_visible"]))
+        steps_u = NO if up["steps"] is KEEP else gr.update(value=int(up["steps"]))
+        download = NO if up["download"] is KEEP else gr.update(**up["download"])
+        values = [val("status"), val("checkup"), val("gallery"), val("tag_rows"),
+                  val("image_rows"), val("stats"), val("zip_file"), val("prepared_dir"),
+                  steps_u, val("train_result"), stop, download,
+                  _result_versions(new_seen), gr.update(active=False)]
+        return tuple(values)
 
     def _after_start(refusal):
         up, seen = compose_ui(runner.snapshot(), {})      # 全部を送り直す
@@ -2603,13 +2669,20 @@ def build_easy_tab(
             start = gr.Button("学習開始", variant="primary")
 
         # ---- 配線 ----------------------------------------------------------
-        seen_state = gr.State({})                 # この画面に、どこまで送ったかの記録
-        timer = gr.Timer(1.0, active=True) if use_timer else None
+        seen_state = gr.State({})                 # 進捗HTMLのポーリング位置
+        if use_timer:
+            result_seen_state = gr.State({"prep_version": 0, "train_version": 0})
+            timer = gr.Timer(1.0, active=True)
+            # 結果コンポーネントは、準備/学習の結果が変わった時に一度だけ更新する。
+            result_timer = gr.Timer(0.25, active=False)
+        else:
+            result_seen_state = None
+            timer = result_timer = None
         poll_outputs = [prep_progress, train_progress, status, checkup, gallery, tag_table,
                         image_table, stats, zip_file, prepared_dir, steps, train_result,
                         stop_btn, lora_download, seen_state]
         if use_timer:
-            poll_outputs.append(timer)
+            poll_outputs.extend([result_seen_state, timer, result_timer])
 
         prep_inputs = [files, folder_path, dataset_name, preset, trigger,
                        general_threshold, character_threshold, manual_keep, manual_remove,
@@ -2627,7 +2700,16 @@ def build_easy_tab(
         stop_btn.click(_stop, None, [stop_note], **fast)
 
         if use_timer:
-            timer.tick(poll, [seen_state], poll_outputs, **fast)
+            # 毎秒の出力対象を進捗バーだけに限定する。
+            # ギャラリー・表・結果欄は result_timer で版数変更時に一度だけ更新する。
+            timer.tick(
+                poll_progress, [seen_state, result_seen_state],
+                [prep_progress, train_progress, seen_state, result_timer, timer], **fast)
+            result_timer.tick(
+                poll_results, [result_seen_state],
+                [status, checkup, gallery, tag_table, image_table, stats, zip_file,
+                 prepared_dir, steps, train_result, stop_btn, lora_download,
+                 result_seen_state, result_timer], **fast)
         else:
             # 古いGradio: ページを開いている間、1秒ごとに状態を取りに行く
             try:

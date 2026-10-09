@@ -1484,7 +1484,7 @@ class TestUI(unittest.TestCase):
         self.assertGreater(len(demo.fns), 5)
 
     def test_live_outputs_disable_gradio_pending_fade(self):
-        """Timer polling must not dim the progress/status components between updates."""
+        """Frequently-updated progress/status components must not fade between updates."""
         import gradio as gr
         with gr.Blocks() as demo:
             E.build_easy_tab(types.SimpleNamespace(), load_real_configs(), gradio_module=gr)
@@ -1493,7 +1493,7 @@ class TestUI(unittest.TestCase):
             block for block in demo.blocks.values()
             if "tt-no-flicker" in (getattr(block, "elem_classes", None) or [])
         ]
-        self.assertEqual(len(live_outputs), 5, "2 progress HTML + 3 dynamically polled Markdown outputs")
+        self.assertEqual(len(live_outputs), 5, "2 progress HTML + 3 status/result Markdown outputs")
 
         style_blocks = [
             getattr(block, "value", "") for block in demo.blocks.values()
@@ -1504,6 +1504,45 @@ class TestUI(unittest.TestCase):
                 for value in style_blocks),
             "Gradio's pending opacity animation must be disabled only for live outputs",
         )
+
+    def test_second_timer_does_not_target_preview_or_result_components(self):
+        """The one-second poll must not include the gallery/tables/settings' result area."""
+        import gradio as gr
+        with gr.Blocks() as demo:
+            E.build_easy_tab(types.SimpleNamespace(), load_real_configs(), gradio_module=gr)
+
+        timer_ids = [bid for bid, block in demo.blocks.items() if type(block).__name__ == "Timer"]
+        self.assertEqual(len(timer_ids), 2, "progress and one-shot result timers are separated")
+        deps = demo.config["dependencies"]
+
+        def tick_dependency(timer_id):
+            matches = [d for d in deps if any(
+                isinstance(target, (tuple, list)) and len(target) >= 2
+                and target[0] == timer_id and target[1] == "tick"
+                for target in d.get("targets", [])
+            )]
+            self.assertEqual(len(matches), 1, f"timer {timer_id} should have one tick handler")
+            return matches[0]
+
+        progress_timer_id = next(
+            bid for bid, block in demo.blocks.items()
+            if type(block).__name__ == "Timer" and float(getattr(block, "value", 0) or 0) == 1.0
+        )
+        result_timer_id = next(bid for bid in timer_ids if bid != progress_timer_id)
+        progress_dep = tick_dependency(progress_timer_id)
+        result_dep = tick_dependency(result_timer_id)
+
+        gallery_id = next(
+            bid for bid, block in demo.blocks.items()
+            if type(block).__name__ == "Gallery"
+            and str(getattr(block, "label", "")).startswith("学習用データのプレビュー")
+        )
+        self.assertNotIn(gallery_id, progress_dep["outputs"],
+                         "gallery must not be a target of every-second polling")
+        self.assertIn(gallery_id, result_dep["outputs"],
+                      "gallery still updates when a preparation result is ready")
+        self.assertEqual(len(progress_dep["outputs"]), 5,
+                         "the progress timer targets only two bars, state, and timer controls")
 
     def test_build_tab_without_models(self):
         import gradio as gr
