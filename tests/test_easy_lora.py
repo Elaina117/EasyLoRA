@@ -850,8 +850,8 @@ class TestDownload(unittest.TestCase):
                          "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors")
         self.assertTrue(by_file["anima-base-v1.0.safetensors"].needs_modules)
 
-    def _fake_catalog(self, needs_modules=False):
-        spec = E.CatalogModel("★ Fake（テスト）", "x/y", "dir/m.safetensors", 0.0, needs_modules)
+    def _fake_catalog(self, companions=()):
+        spec = E.CatalogModel("★ Fake（テスト）", "x/y", "dir/m.safetensors", 0.0, companions)
         spec.__class__ = type("S", (E.CatalogModel,), {"url": property(lambda s: self.srv.url("/redirect/m.safetensors"))})
         return spec
 
@@ -874,28 +874,6 @@ class TestDownload(unittest.TestCase):
         finally:
             E.CATALOG_BY_LABEL.clear(); E.CATALOG_BY_LABEL.update(saved[0]); E.checkpoint_dir = saved[1]
 
-    def test_modules_check_for_split_models(self):
-        spec = E.CatalogModel("★ Anima base v1.0（x）", "r", "p/anima.safetensors", 4.2, needs_modules=True)
-        saved = {k: sys.modules.get(k) for k in ("modules", "modules.shared")}
-        try:
-            shared = types.ModuleType("modules.shared")
-            shared.opts = types.SimpleNamespace(forge_additional_modules=[])
-            mods = types.ModuleType("modules"); mods.shared = shared
-            sys.modules.update({"modules": mods, "modules.shared": shared})
-            with self.assertRaises(RuntimeError) as cm:
-                E.check_webui_modules_for(spec)
-            self.assertIn("VAE", str(cm.exception))
-            self.assertIn("Anima base v1.0", str(cm.exception))
-            shared.opts.forge_additional_modules = ["/x/vae.safetensors", "/x/te.safetensors"]
-            E.check_webui_modules_for(spec)                       # 選択済みなら通る
-            del shared.opts.forge_additional_modules              # Forge以外(属性なし)は確認しない
-            E.check_webui_modules_for(spec)
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    sys.modules.pop(k, None)
-                else:
-                    sys.modules[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -955,30 +933,534 @@ class TestProgress(unittest.TestCase):
         with E.hook_training_progress(types.SimpleNamespace(), E.ProgressTracker(), 10):
             pass  # tqdm属性が無くても落ちない
 
-    def test_iter_with_progress(self):
-        import time as _time
-        tracker = E.ProgressTracker()
 
-        def job():
-            for i in range(3):
-                tracker.set("t", i / 3, str(i))
-                _time.sleep(0.15)
-            return "RESULT"
+# ---------------------------------------------------------------------------
+# Anima の VAE / Text Encoder（自動ダウンロードと一時的な選択）
+# ---------------------------------------------------------------------------
 
-        gen = E.iter_with_progress(job, tracker, interval=0.05)
-        snaps = []
-        try:
-            while True:
-                snaps.append(next(gen))
-        except StopIteration as stop:
-            result = stop.value
-        self.assertEqual(result, "RESULT")
-        self.assertGreaterEqual(len(snaps), 3)
+def local_companion(kind, label, srv, name):
+    comp = E.CompanionFile(kind, label, "x/y", f"split/{name}")
+    comp.__class__ = type("LC", (E.CompanionFile,),
+                          {"url": property(lambda s: srv.url(f"/redirect/{s.filename}"))})
+    return comp
 
-        def bad():
-            raise RuntimeError("boom")
-        with self.assertRaises(RuntimeError):
-            list(E.iter_with_progress(bad, E.ProgressTracker(), interval=0.01))
+
+class TestAnimaCompanions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="easylora_anima_"))
+        self.blob = make_safetensors(20000)
+        self.srv = FileServer({"qwen_image_vae.safetensors": self.blob,
+                               "qwen_3_06b_base.safetensors": self.blob})
+        self.vae_dir, self.te_dir = self.tmp / "VAE", self.tmp / "text_encoder"
+        self._orig_dirs = E.module_dirs
+        E.module_dirs = lambda kind: [self.vae_dir if kind == "vae" else self.te_dir]
+        self.comps = (local_companion("vae", "VAE", self.srv, "qwen_image_vae.safetensors"),
+                      local_companion("text_encoder", "Text Encoder", self.srv, "qwen_3_06b_base.safetensors"))
+
+    def tearDown(self):
+        E.module_dirs = self._orig_dirs
+        self.srv.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_looks_like_anima(self):
+        for yes in ("anima_baseV10.safetensors", "anima-base-v1.0.safetensors [abc123]",
+                    "Anima_preview2.safetensors"):
+            self.assertTrue(E.looks_like_anima(yes), yes)
+        for no in ("animagineXL_v3.safetensors", "illustriousXL.safetensors", "ponyDiffusionV6.safetensors",
+                   "myanima.safetensors", ""):
+            self.assertFalse(E.looks_like_anima(no), no)
+
+    def test_companions_only_for_anima(self):
+        anima = [m for m in E.MODEL_CATALOG if "anima" in m.filename.lower()][0]
+        illust = [m for m in E.MODEL_CATALOG if "illustrious" in m.filename.lower()][0]
+        self.assertEqual(E.companions_for(anima.label), E.ANIMA_COMPANIONS)
+        self.assertEqual(E.companions_for("anima_baseV10.safetensors"), E.ANIMA_COMPANIONS)
+        self.assertEqual(E.companions_for(illust.label), ())
+        self.assertEqual(E.companions_for("animagineXL_v3.safetensors"), ())
+        self.assertEqual(E.companions_for("sd15.safetensors"), ())
+
+    def test_anima_companion_urls_match_the_requested_ones(self):
+        urls = {c.kind: c.url for c in E.ANIMA_COMPANIONS}
+        self.assertEqual(urls["vae"],
+                         "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/vae/qwen_image_vae.safetensors")
+        self.assertEqual(urls["text_encoder"],
+                         "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/qwen_3_06b_base.safetensors")
+        anima = [m for m in E.MODEL_CATALOG if "anima" in m.filename.lower()][0]
+        self.assertEqual(anima.companions, E.ANIMA_COMPANIONS)
+        self.assertTrue(anima.needs_modules)
+
+    def test_downloads_missing_files_into_the_right_folders(self):
+        calls = []
+        paths = E.ensure_companions(self.comps, lambda c, d, t, s: calls.append(c.kind), refresh=False)
+        self.assertEqual([Path(p) for p in paths],
+                         [self.vae_dir / "qwen_image_vae.safetensors", self.te_dir / "qwen_3_06b_base.safetensors"])
+        for p in paths:
+            self.assertEqual(Path(p).read_bytes(), self.blob)
+        self.assertEqual(set(calls), {"vae", "text_encoder"})
+
+    def test_existing_files_are_reused_even_with_different_naming(self):
+        self.vae_dir.mkdir(); self.te_dir.mkdir()
+        (self.vae_dir / "Qwen-Image-VAE.safetensors").write_bytes(self.blob)
+        paths = E.ensure_companions(self.comps, refresh=False)
+        self.assertEqual(Path(paths[0]).name, "Qwen-Image-VAE.safetensors")
+        self.assertEqual(Path(paths[1]).name, "qwen_3_06b_base.safetensors")
+        self.assertEqual([r for r in self.srv.requests if "qwen_image_vae" in r[0]], [],
+                         "VAEは既にあるのでダウンロードしない")
+
+    def test_broken_existing_file_is_replaced(self):
+        self.vae_dir.mkdir()
+        (self.vae_dir / "qwen_image_vae.safetensors").write_bytes(b"truncated")
+        paths = E.ensure_companions(self.comps, refresh=False)
+        self.assertEqual(Path(paths[0]).read_bytes(), self.blob)
+
+
+class TestUseWebuiModules(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: sys.modules.get(k) for k in ("modules", "modules.shared", "modules_forge",
+                                                       "modules_forge.main_entry")}
+        self.log = []
+
+        class Opts:
+            def __init__(s):
+                s.forge_additional_modules = ["/x/user_vae.safetensors"]
+
+            def set(s, key, value):
+                setattr(s, key, value)
+        log = self.log
+        shared = types.ModuleType("modules.shared"); shared.opts = Opts()
+        mods = types.ModuleType("modules"); mods.shared = shared
+        me = types.ModuleType("modules_forge.main_entry")
+        me.refresh_model_loading_parameters = lambda refresh=True: log.append("refresh_params")
+        mf = types.ModuleType("modules_forge"); mf.main_entry = me
+        sys.modules.update({"modules": mods, "modules.shared": shared,
+                            "modules_forge": mf, "modules_forge.main_entry": me})
+        self.shared = shared
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def test_switches_for_training_and_restores_afterwards(self):
+        with E.use_webui_modules(["/m/vae.safetensors", "/m/te.safetensors"]) as changed:
+            self.assertTrue(changed)
+            self.assertEqual(self.shared.opts.forge_additional_modules,
+                             ["/m/te.safetensors", "/m/vae.safetensors"])
+        self.assertEqual(self.shared.opts.forge_additional_modules, ["/x/user_vae.safetensors"],
+                         "ユーザーの選択は元に戻る")
+        self.assertEqual(self.log, ["refresh_params"])
+
+    def test_restores_even_if_training_fails(self):
+        with self.assertRaises(ValueError):
+            with E.use_webui_modules(["/m/a.safetensors"]):
+                raise ValueError("boom")
+        self.assertEqual(self.shared.opts.forge_additional_modules, ["/x/user_vae.safetensors"])
+
+    def test_no_change_when_already_selected(self):
+        with E.use_webui_modules(["/x/user_vae.safetensors"]) as changed:
+            self.assertFalse(changed)
+        self.assertEqual(self.log, [])
+
+    def test_noop_outside_forge(self):
+        del self.shared.opts.forge_additional_modules
+        with E.use_webui_modules(["/m/a.safetensors"]) as changed:
+            self.assertFalse(changed)
+
+
+# ---------------------------------------------------------------------------
+# 画面状態の組み立て（サーバー側の状態 → 画面）
+# ---------------------------------------------------------------------------
+
+def idle_snapshot(**kw):
+    snap = {"running": False, "stage": "", "progress": {"title": "", "frac": None, "detail": ""},
+            "prep_version": 0, "prep_out": None, "train_version": 0, "train_msg": "",
+            "stop_visible": False, "download": {"visible": False}}
+    snap.update(kw)
+    return snap
+
+
+class TestComposeUI(unittest.TestCase):
+    def test_first_render_sends_everything_then_goes_idle(self):
+        up, seen = E.compose_ui(idle_snapshot(), {})
+        self.assertEqual(up["prep_progress"], "")
+        self.assertEqual(up["train_result"], "")
+        self.assertIs(up["stop_visible"], False)
+        self.assertTrue(up["active"], "初回は送った直後なので、もう1回だけ問い合わせる")
+        up2, _ = E.compose_ui(idle_snapshot(), seen)
+        self.assertTrue(all(v is E.KEEP for k, v in up2.items() if k != "active"))
+        self.assertFalse(up2["active"], "何も変わらず実行中でもなければ、問い合わせを止める")
+
+    def test_running_sends_only_the_progress_bar_when_it_changes(self):
+        snap = idle_snapshot(running=True, stage="train",
+                             progress={"title": "学習中", "frac": 0.5, "detail": "5 / 10 step"})
+        _, seen = E.compose_ui(idle_snapshot(), {})
+        up, seen = E.compose_ui(snap, seen)
+        self.assertIn("50%", up["train_progress"])
+        self.assertTrue(up["active"])
+        same, _ = E.compose_ui(snap, seen)
+        self.assertIs(same["train_progress"], E.KEEP, "同じ表示は送り直さない")
+        self.assertTrue(same["active"], "実行中は問い合わせを続ける")
+
+    def test_results_are_sent_once_per_version(self):
+        out = {"status": "ok", "checkup": "c", "gallery": [("a.jpg", "cap")], "tag_rows": [["t"]],
+               "image_rows": [["i"]], "stats": "{}", "zip_file": "/z.zip", "prepared_dir": "/p", "steps": 600}
+        snap = idle_snapshot(prep_version=3, prep_out=out)
+        up, seen = E.compose_ui(snap, {})
+        for k, v in out.items():
+            self.assertEqual(up[k], v)
+        up2, _ = E.compose_ui(snap, seen)
+        self.assertIs(up2["status"], E.KEEP)
+        self.assertIs(up2["gallery"], E.KEEP)
+
+    def test_a_returning_browser_catches_up(self):
+        """タブを離れて、その間に処理が終わった。戻った時の1回の問い合わせで、完了状態になる。"""
+        running = idle_snapshot(running=True, stage="train",
+                                progress={"title": "学習中", "frac": 0.4, "detail": "x"})
+        _, seen = E.compose_ui(running, {})
+        finished = idle_snapshot(train_version=2, train_msg="### ✅ 学習完了",
+                                 download={"value": "/t/a.safetensors", "visible": True, "label": "x"})
+        up, _ = E.compose_ui(finished, seen)
+        self.assertEqual(up["train_progress"], "", "進捗バーは消える")
+        self.assertEqual(up["train_result"], "### ✅ 学習完了")
+        self.assertTrue(up["download"]["visible"])
+
+    def test_reload_restores_everything(self):
+        snap = idle_snapshot(train_version=2, train_msg="### ✅ 学習完了",
+                             download={"value": "/t/a.safetensors", "visible": True, "label": "x"})
+        up, _ = E.compose_ui(snap, {})
+        self.assertEqual(up["train_result"], "### ✅ 学習完了")
+        self.assertTrue(up["download"]["visible"])
+
+
+# ---------------------------------------------------------------------------
+# ジョブ実行（サーバー側に状態を持つ）
+# ---------------------------------------------------------------------------
+
+import time
+
+
+def make_fake_train_module(stub, lora_dir, load_s=0.0, step_s=0.01, loop_hook=None):
+    """train.py の挙動を真似た偽物。特に「停止フラグは学習ループの直前にリセットされる」点を再現する。"""
+    from tqdm import tqdm
+    idx = E._config_index(stub.all_configs)
+
+    class FakeTrainModule:
+        def __init__(self):
+            self.tqdm = tqdm
+            self.stopped = []
+            self.flag = 0
+            self.args = []
+
+        def stop_time(self, save):
+            self.stopped.append(save)
+            self.flag = 2 if save else 1
+
+        def train(self, *args):
+            self.args.append(args)
+            steps = int(args[5 + idx["train_iterations"]])
+            name = args[5 + idx["save_lora_name"]]
+            time.sleep(load_s)                                  # モデルの読み込み
+            if loop_hook:
+                loop_hook(self)
+            self.flag = 0                                       # 本物の train_lora と同じ位置でリセット
+            bar = self.tqdm(range(steps), file=io.StringIO())
+            for i in range(steps):
+                if self.flag > 0:
+                    if self.flag > 1:
+                        p = Path(lora_dir, f"{name}_{i}steps.safetensors")
+                        p.write_bytes(b"LORA")
+                        return f"Stopped. Successfully created to {p}"
+                    return "Stopped"
+                time.sleep(step_s)
+                bar.update(1)
+            p = Path(lora_dir, f"{name}.safetensors")
+            p.write_bytes(b"LORA")
+            return f"Successfully created to {p}"
+
+    return FakeTrainModule()
+
+
+class RunnerBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="easylora_runner_"))
+        self.ext_root = self.tmp / "ext"; self.ext_root.mkdir()
+        self._o = (E._extension_root, E.WD14Tagger, E.checkpoint_dir, E._RUNNER)
+        E._extension_root = lambda: self.ext_root
+        E.WD14Tagger = FakeTagger
+        FakeTagger.script = staticmethod(character_script)
+        self.ckpt = self.tmp / "ckpt"; self.ckpt.mkdir()
+        E.checkpoint_dir = lambda: self.ckpt
+        E._RUNNER = None
+        self.src = self.tmp / "src"; self.src.mkdir()
+        for i in range(6):
+            structured_image(i).save(self.src / f"img{i}.png")
+        self.stub = load_real_configs()
+        self.lora_dir = self.tmp / "lora"; self.lora_dir.mkdir()
+        self.stub.lora_dir = str(self.lora_dir)
+        (self.ckpt / "plain.safetensors").write_bytes(make_safetensors(100))
+
+    def tearDown(self):
+        E._extension_root, E.WD14Tagger, E.checkpoint_dir, E._RUNNER = self._o
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def prep_kwargs(self, **kw):
+        d = dict(files=None, folder_path=str(self.src), dataset_name="job", preset_name="キャラクター",
+                 trigger="", general_threshold=0.35, character_threshold=0.85,
+                 manual_keep_text="", manual_remove_text="", auto_threshold=True, free_mem=False)
+        d.update(kw)
+        return d
+
+    def train_kwargs(self, **kw):
+        d = dict(prepared_dir=None, trigger="", dataset_name="job", output_name="", preset_name="キャラクター",
+                 size_choice="自動", steps=30, model="plain.safetensors", vae="None", te="None", free_mem=False)
+        d.update(kw)
+        return d
+
+    def wait(self, runner, timeout=30):
+        runner.join(timeout)
+        self.assertFalse(runner.running, "処理が終わらなかった")
+
+    def record_titles(self, runner):
+        """進捗の更新をすべて記録する（ポーリングだと、短い表示を取り逃がすことがあるため）。"""
+        titles = []
+        original = runner.tracker.set
+
+        def recording(title, frac=None, detail=""):
+            if title and (not titles or titles[-1] != title):
+                titles.append(title)
+            original(title, frac, detail)
+        runner.tracker.set = recording
+        return titles
+
+    def wait_for(self, condition, timeout=10, what="条件"):
+        """条件が満たされるまで待つ。無限には待たず、満たされなければテストを失敗させる。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return
+            time.sleep(0.01)
+        self.fail(f"{timeout}秒待っても {what} になりませんでした")
+
+
+class TestJobRunner(RunnerBase):
+    def test_prep_only(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        runner = E.JobRunner(tm, self.stub)
+        self.assertIsNone(runner.start({"prep": self.prep_kwargs(), "train": None}))
+        self.wait(runner)
+        snap = runner.snapshot()
+        self.assertIn("✅ 学習データの準備ができました", snap["prep_out"]["status"])
+        self.assertIn("準備済みデータで学習だけ実行", snap["prep_out"]["status"])
+        self.assertEqual(tm.args, [], "準備だけの時は学習しない")
+        self.assertEqual(snap["train_msg"], "")
+
+    def test_prep_failure_is_reported_not_raised(self):
+        runner = E.JobRunner(make_fake_train_module(self.stub, self.lora_dir), self.stub)
+        runner.start({"prep": self.prep_kwargs(folder_path=str(self.tmp / "nope")), "train": None})
+        self.wait(runner)
+        self.assertIn("❌ 準備に失敗しました", runner.snapshot()["prep_out"]["status"])
+        self.assertFalse(runner.snapshot()["running"])
+
+    def test_one_click_flow_and_phases(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir, load_s=0.6, step_s=0.02)
+        runner = E.JobRunner(tm, self.stub)
+        titles, details = [], []
+        runner.start({"prep": self.prep_kwargs(), "train": self.train_kwargs()})
+        deadline = time.time() + 40
+        while runner.running and time.time() < deadline:
+            p = runner.snapshot()["progress"]
+            if p["title"] and (not titles or titles[-1] != p["title"]):
+                titles.append(p["title"]); details.append(p["detail"])
+            time.sleep(0.02)
+        self.wait(runner)
+        snap = runner.snapshot()
+        self.assertIn("✅ 学習完了", snap["train_msg"])
+        self.assertIn("LoRAを保存しました", snap["train_msg"])
+        self.assertTrue(snap["download"]["visible"] and os.path.isfile(snap["download"]["value"]))
+        self.assertFalse(snap["stop_visible"])
+        joined = " ".join(titles)
+        for phase in ("準備中", "メモリを空けています", "モデルを読み込み中", "学習中"):
+            self.assertIn(phase, joined)
+        # 要望: モデルの読み込み中は、メモリ使用量ではなく「読み込み中」のメッセージを出す
+        i = titles.index("モデルを読み込み中")
+        self.assertNotIn("メモリ使用量", details[i])
+        self.assertIn("読み込んでいます", details[i])
+        self.assertEqual(snap["prep_out"]["steps"], 400)
+        idx = E._config_index(self.stub.all_configs)
+        self.assertEqual(int(tm.args[0][5 + idx["train_iterations"]]), 400,
+                         "おまかせ実行では、準備で決まった学習stepを使う")
+
+    def test_second_start_is_refused_while_running(self):
+        runner = E.JobRunner(make_fake_train_module(self.stub, self.lora_dir, load_s=0.5), self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src))})
+        refusal = runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src))})
+        self.assertIn("すでに別の処理を実行中", refusal)
+        self.wait(runner)
+
+    def test_stop_during_training_saves(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir, step_s=0.05)
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), steps=200)})
+        self.wait_for(lambda: runner.loop_started, what="学習ループの開始")
+        time.sleep(0.2)
+        self.assertIn("保存して止まります", runner.request_stop())
+        self.wait(runner)
+        self.assertEqual(tm.stopped, [True])
+        snap = runner.snapshot()
+        self.assertIn("⏹", snap["train_msg"])
+        self.assertIn("steps.safetensors", snap["download"]["value"], "停止保存の別名ファイルがダウンロードできる")
+
+    def test_stop_while_loading_does_not_leave_a_one_step_lora(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir, load_s=0.6, step_s=0.02)
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), steps=200)})
+        self.wait_for(lambda: runner.snapshot()["progress"]["title"] == "モデルを読み込み中", what="モデル読み込み中")
+        self.assertIn("読み込みが終わった時点", runner.request_stop())
+        self.wait(runner)
+        self.assertEqual(tm.stopped, [False], "保存しない停止で止める")
+        self.assertEqual(list(self.lora_dir.glob("*.safetensors")), [])
+        self.assertFalse(runner.snapshot()["download"]["visible"])
+
+    def test_stop_when_idle(self):
+        runner = E.JobRunner(make_fake_train_module(self.stub, self.lora_dir), self.stub)
+        self.assertIn("実行中の処理はありません", runner.request_stop())
+
+    def test_training_error_is_reported_and_runner_recovers(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        tm.train = lambda *a: "Error: CUDA out of memory. Tried to allocate 2 GiB"
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src))})
+        self.wait(runner)
+        msg = runner.snapshot()["train_msg"]
+        self.assertIn("エラーが発生しました", msg)
+        self.assertIn("学習解像度を下げて", msg)
+        self.assertIsNone(runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src))}))
+        self.wait(runner)
+
+    def test_get_runner_survives_ui_reload(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        self.assertIs(E.get_runner(tm, self.stub), E.get_runner(tm, self.stub))
+
+    def test_work_finishes_without_anyone_watching(self):
+        """画面(ブラウザ)が1度も問い合わせに来なくても、処理は最後まで進み、結果が保持される。"""
+        tm = make_fake_train_module(self.stub, self.lora_dir, step_s=0.01)
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": self.prep_kwargs(), "train": self.train_kwargs()})
+        self.wait(runner)                                     # snapshot() は一度も呼ばない
+        up, _ = E.compose_ui(runner.snapshot(), {})           # 後から戻ってきたブラウザ
+        self.assertIn("✅ 学習完了", up["train_result"])
+        self.assertTrue(up["download"]["visible"])
+        self.assertIn("準備ができました", up["status"])
+
+
+class TestJobRunnerDownloadsAndAnima(RunnerBase):
+    def setUp(self):
+        super().setUp()
+        self.blob = make_safetensors(400000)            # 約1.6MB（ダウンロード中の状態を観測できる大きさ）
+        self.srv = FileServer({"m.safetensors": self.blob, "vae.safetensors": self.blob, "te.safetensors": self.blob})
+        self.vae_dir, self.te_dir = self.tmp / "VAE", self.tmp / "text_encoder"
+        self._om = E.module_dirs
+        E.module_dirs = lambda kind: [self.vae_dir if kind == "vae" else self.te_dir]
+        self.companions = (local_companion("vae", "VAE", self.srv, "vae.safetensors"),
+                           local_companion("text_encoder", "Text Encoder", self.srv, "te.safetensors"))
+        self._ocat = dict(E.CATALOG_BY_LABEL)
+        spec = E.CatalogModel("★ Anima（テスト）", "x/y", "d/m.safetensors", 0.0, self.companions)
+        spec.__class__ = type("S", (E.CatalogModel,), {"url": property(lambda s: self.srv.url("/redirect/m.safetensors"))})
+        E.CATALOG_BY_LABEL[spec.label] = spec
+        self.spec = spec
+
+        class Opts:
+            forge_additional_modules = ["/user/own.safetensors"]
+
+            def set(s, k, v):
+                setattr(s, k, v)
+        self._saved = {k: sys.modules.get(k) for k in ("modules", "modules.shared")}
+        shared = types.ModuleType("modules.shared"); shared.opts = Opts()
+        mods = types.ModuleType("modules"); mods.shared = shared
+        sys.modules.update({"modules": mods, "modules.shared": shared})
+        self.opts = shared.opts
+
+    def tearDown(self):
+        E.module_dirs = self._om
+        E.CATALOG_BY_LABEL.clear(); E.CATALOG_BY_LABEL.update(self._ocat)
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        self.srv.close()
+        super().tearDown()
+
+    def test_anima_downloads_everything_and_uses_it_only_during_training(self):
+        seen_during = {}
+        tm = make_fake_train_module(self.stub, self.lora_dir,
+                                    loop_hook=lambda t: seen_during.update(m=list(self.opts.forge_additional_modules)))
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), model=self.spec.label)})
+        self.wait(runner)
+        self.assertIn("✅ 学習完了", runner.snapshot()["train_msg"])
+        self.assertEqual((self.ckpt / "m.safetensors").read_bytes(), self.blob)
+        self.assertEqual((self.vae_dir / "vae.safetensors").read_bytes(), self.blob)
+        self.assertEqual((self.te_dir / "te.safetensors").read_bytes(), self.blob)
+        want = sorted(os.path.normpath(str(p)) for p in (self.vae_dir / "vae.safetensors", self.te_dir / "te.safetensors"))
+        self.assertEqual(seen_during["m"], want, "学習中は、ダウンロードしたVAE/TEが使われる")
+        self.assertEqual(self.opts.forge_additional_modules, ["/user/own.safetensors"], "学習後は元の選択に戻る")
+
+    def test_second_run_does_not_download_again(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        runner = E.JobRunner(tm, self.stub)
+        for _ in range(2):
+            runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), model=self.spec.label)})
+            self.wait(runner)
+        files = [r[0] for r in self.srv.requests if r[0].startswith("/redirect/")]
+        self.assertEqual(sorted(files), ["/redirect/m.safetensors", "/redirect/te.safetensors", "/redirect/vae.safetensors"])
+
+    def test_non_anima_model_never_touches_modules_or_downloads_companions(self):
+        seen_during = {}
+        tm = make_fake_train_module(self.stub, self.lora_dir,
+                                    loop_hook=lambda t: seen_during.update(m=list(self.opts.forge_additional_modules)))
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), model="plain.safetensors")})
+        self.wait(runner)
+        self.assertEqual(seen_during["m"], ["/user/own.safetensors"])
+        self.assertFalse(self.vae_dir.exists() or self.te_dir.exists())
+
+    def test_progress_names_each_download(self):
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        runner = E.JobRunner(tm, self.stub)
+        titles = self.record_titles(runner)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), model=self.spec.label)})
+        self.wait(runner)
+        self.assertIn("モデルをダウンロード中", titles)
+        self.assertIn("VAEをダウンロード中", titles)
+        self.assertIn("Text Encoderをダウンロード中", titles)
+        order = [titles.index(t) for t in ("モデルをダウンロード中", "VAEをダウンロード中",
+                                           "Text Encoderをダウンロード中", "モデルを読み込み中", "学習中")]
+        self.assertEqual(order, sorted(order), f"表示の順番がおかしい: {titles}")
+
+    def test_stop_during_model_download_cancels_and_keeps_partial_file(self):
+        self.srv.delay = 0.08
+        tm = make_fake_train_module(self.stub, self.lora_dir)
+        runner = E.JobRunner(tm, self.stub)
+        runner.start({"prep": None, "train": self.train_kwargs(prepared_dir=str(self.src), model=self.spec.label)})
+        self.wait_for(lambda: runner.snapshot()["progress"]["title"] == "モデルをダウンロード中",
+                      what="モデルのダウンロード中")
+        time.sleep(0.4)
+        runner.request_stop()
+        self.wait(runner)
+        self.assertIn("中止しました", runner.snapshot()["train_msg"])
+        self.assertEqual(tm.args, [], "学習は始まらない")
+        self.assertFalse((self.ckpt / "m.safetensors").exists())
+        self.assertTrue((self.ckpt / "m.safetensors.part").exists(), "次回は続きから再開できる")
+
+
+class TestTabName(unittest.TestCase):
+    def test_tab_is_named_lora_gakushu_but_keeps_internal_id(self):
+        src = (ROOT / "scripts" / "traintrain.py").read_text(encoding="utf-8")
+        self.assertIn('return (ui, "LoRA学習", "TrainTrain"),', src)
+        self.assertNotIn('(ui, "TrainTrain", "TrainTrain")', src)
 
 
 # ---------------------------------------------------------------------------

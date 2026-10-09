@@ -521,7 +521,7 @@ def on_ui_tabs():
 
         reload_plot.click(plot_csv, [plot_file],[plot])
 
-    return (ui, "TrainTrain", "TrainTrain"),
+    return (ui, "LoRA学習", "TrainTrain"),
 
 import os
 import pandas as pd

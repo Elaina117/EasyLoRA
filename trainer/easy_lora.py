@@ -1318,12 +1318,41 @@ def prepare_download(path: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class CompanionFile:
+    """モデル本体とは別に必要なファイル（分割配布のモデルのVAE・Text Encoder）。"""
+    kind: str             # "vae" | "text_encoder"
+    label: str            # 画面表示用
+    repo: str
+    path: str
+
+    @property
+    def filename(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def url(self) -> str:
+        return f"https://huggingface.co/{self.repo}/resolve/main/{self.path}"
+
+
+# Anima は本体(diffusion model)だけの分割配布。VAEとText Encoderも要る。
+ANIMA_COMPANIONS = (
+    CompanionFile("vae", "VAE", "circlestone-labs/Anima", "split_files/vae/qwen_image_vae.safetensors"),
+    CompanionFile("text_encoder", "Text Encoder", "circlestone-labs/Anima",
+                  "split_files/text_encoders/qwen_3_06b_base.safetensors"),
+)
+
+
+@dataclass
 class CatalogModel:
     label: str            # ドロップダウンに出す名前
     repo: str             # Hugging Face のリポジトリ
     path: str             # リポジトリ内のファイルパス
     size_gb: float        # 目安（画面表示用。実際のサイズはダウンロード時に取得）
-    needs_modules: bool = False   # VAE/Text EncoderをWebUI側で選ぶ必要があるか（分割配布のモデル）
+    companions: tuple = ()        # 一緒に必要なVAE・Text Encoder
+
+    @property
+    def needs_modules(self) -> bool:
+        return bool(self.companions)
 
     @property
     def filename(self) -> str:
@@ -1346,7 +1375,7 @@ MODEL_CATALOG = [
         repo="circlestone-labs/Anima",
         path="split_files/diffusion_models/anima-base-v1.0.safetensors",
         size_gb=4.18,
-        needs_modules=True,
+        companions=ANIMA_COMPANIONS,
     ),
 ]
 CATALOG_BY_LABEL = {m.label: m for m in MODEL_CATALOG}
@@ -1422,7 +1451,7 @@ def is_valid_safetensors(path) -> bool:
 
 
 def download_file(url: str, dest: Path, progress_cb: Optional[Callable[[int, int, float], None]] = None,
-                  retries: int = 5, chunk: int = 4 * 1024 * 1024) -> Path:
+                  retries: int = 5, chunk: int = 256 * 1024) -> Path:
     """URLをdestへ保存する。途中から再開でき、サイズが合わなければ再試行する。
 
     - 保存中は dest + ".part" に書き、完了してから本来の名前に変える（途中のファイルを使わせない）
@@ -1476,6 +1505,8 @@ def download_file(url: str, dest: Path, progress_cb: Optional[Callable[[int, int
                         pass
 
                     done, t0, t_last, speed = have, time.time(), 0.0, 0.0
+                    if progress_cb:
+                        progress_cb(done, total, 0.0)   # 開始を知らせる（表示の切り替えと、停止の判定を即座に効かせる）
                     with open(part, "ab" if have else "wb") as f:
                         for block in r.iter_content(chunk_size=chunk):
                             if not block:
@@ -1527,20 +1558,107 @@ def checkpoint_name_for(path: Path) -> str:
     return str(path)
 
 
-def check_webui_modules_for(spec: CatalogModel):
-    """分割配布のモデル(Anima等)は、VAEとText EncoderをWebUIで選んでいないと読み込めない。"""
-    if not spec.needs_modules:
-        return
+def looks_like_anima(model_value: str) -> bool:
+    """ドロップダウンで選ばれたモデルが Anima か。名前で判定する（animagine など別物は除く）。"""
+    stem = _norm_stem(str(model_value or "").split(" [")[0])
+    return bool(re.match(r"^anima(?!gine)", stem))
+
+
+def companions_for(model_value: str) -> tuple:
+    """このモデルに必要なVAE・Text Encoder。Anima以外は空（何もしない）。"""
+    spec = CATALOG_BY_LABEL.get(model_value)
+    if spec is not None:
+        return spec.companions
+    return ANIMA_COMPANIONS if looks_like_anima(model_value) else ()
+
+
+def module_dirs(kind: str) -> list:
+    """VAE / Text Encoder を置くフォルダ（先頭が、ダウンロードの保存先）。"""
+    sub = "VAE" if kind == "vae" else "text_encoder"
+    dirs: list = []
+    try:
+        from modules import paths, shared
+        dirs.append(Path(paths.models_path) / sub)
+        extra = getattr(shared.cmd_opts, "vae_dirs" if kind == "vae" else "text_encoder_dirs", None) or []
+        dirs.extend(Path(x) for x in extra)
+    except Exception:
+        dirs.append(_extension_root() / "models" / sub)
+    return dirs
+
+
+def find_installed_companion(comp: CompanionFile) -> Optional[Path]:
+    """既にあるVAE/Text Encoderを探す（名前の表記ゆれは無視。壊れたファイルは無視）。"""
+    wanted = _norm_stem(comp.filename)
+    for d in module_dirs(comp.kind):
+        if not d.is_dir():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix.lower() in (".safetensors", ".sft") \
+                    and _norm_stem(p.name) == wanted and is_valid_safetensors(p):
+                return p
+    return None
+
+
+def ensure_companions(companions, progress_cb: Optional[Callable[[CompanionFile, int, int, float], None]] = None,
+                      refresh: bool = True) -> list:
+    """必要なVAE・Text Encoderを揃える。無ければダウンロードする。戻り値はファイルのパスのリスト。"""
+    result = []
+    downloaded = False
+    for comp in companions:
+        found = find_installed_companion(comp)
+        if found is None:
+            dest = module_dirs(comp.kind)[0] / comp.filename
+            download_file(comp.url, dest,
+                          (lambda d, t, sp, c=comp: progress_cb(c, d, t, sp)) if progress_cb else None)
+            if not is_valid_safetensors(dest):
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"ダウンロードした{comp.label}のファイルが壊れていました。もう一度実行してください。")
+            found = dest
+            downloaded = True
+        result.append(found)
+    if downloaded and refresh:
+        try:                                   # Forge Neo: VAE / Text Encoder の一覧を更新
+            from modules_forge import main_entry
+            main_entry.refresh_models()
+        except Exception:
+            pass
+    return result
+
+
+@contextlib.contextmanager
+def use_webui_modules(paths: list):
+    """学習の間だけ、WebUIの「VAE / Text Encoder」の選択を paths にする。終わったら元に戻す。
+
+    TrainTrain は学習開始時に shared.opts.forge_additional_modules を読んでモデルを読み込む。
+    ユーザーの選択を書き換えたままにしないよう、必ず元に戻す（Forge以外では何もしない）。
+    """
     try:
         from modules import shared
-        modules = getattr(shared.opts, "forge_additional_modules", None)
+        has = hasattr(shared.opts, "forge_additional_modules")
     except Exception:
-        return                              # Forge以外では確認できないので何もしない
-    if modules is not None and len(modules) == 0:
-        raise RuntimeError(
-            f"{spec.label.replace('★ ', '').split('（')[0]} は、本体のほかに VAE と Text Encoder が必要です。"
-            "WebUI上部の「VAE / Text Encoder」で、このモデル用のVAEとText Encoderを選んでから、"
-            "もう一度実行してください。")
+        has = False
+    if not has:
+        yield False
+        return
+
+    def norm(items):
+        return sorted(os.path.normpath(str(x)) for x in items)
+
+    previous = list(shared.opts.forge_additional_modules)
+    wanted = norm(paths)
+    changed = norm(previous) != wanted
+    if changed:
+        shared.opts.set("forge_additional_modules", wanted)
+    try:
+        yield changed
+    finally:
+        if changed:
+            shared.opts.set("forge_additional_modules", previous)
+            try:       # 次の画像生成が、画面の選択どおりに読み込まれるようにする
+                from modules_forge.main_entry import refresh_model_loading_parameters
+                refresh_model_loading_parameters(refresh=True)
+            except Exception:
+                pass
 
 
 def resolve_model(model_value: str, progress_cb: Optional[Callable[[int, int, float], None]] = None) -> str:
@@ -1560,7 +1678,6 @@ def resolve_model(model_value: str, progress_cb: Optional[Callable[[int, int, fl
             raise RuntimeError("ダウンロードしたファイルが壊れていました。もう一度実行してください。")
         installed = dest
         refresh_webui_checkpoints()
-    check_webui_modules_for(spec)
     return checkpoint_name_for(installed)
 
 
@@ -1843,7 +1960,8 @@ def _report_tqdm(bar, tracker: ProgressTracker, total_steps: int):
 
 
 @contextlib.contextmanager
-def hook_training_progress(train_module, tracker: ProgressTracker, total_steps: int):
+def hook_training_progress(train_module, tracker: ProgressTracker, total_steps: int,
+                           on_loop: Optional[Callable[[int], None]] = None):
     """学習の間だけ train.py の tqdm を「進捗を記録する版」に差し替える。
 
     train.py 本体は書き換えない（TrainTrain本家の更新を取り込みやすくするため）。
@@ -1867,6 +1985,8 @@ def hook_training_progress(train_module, tracker: ProgressTracker, total_steps: 
         def _tt_report(self):
             try:
                 _report_tqdm(self, tracker, total_steps)
+                if on_loop is not None and self.total and int(self.total) == int(total_steps):
+                    on_loop(int(self.n))          # 学習ループに入った/1step進んだ
             except Exception:
                 pass          # 進捗表示の失敗で学習を止めない
 
@@ -1877,28 +1997,310 @@ def hook_training_progress(train_module, tracker: ProgressTracker, total_steps: 
         train_module.tqdm = base
 
 
-def iter_with_progress(fn: Callable[[], object], tracker: ProgressTracker, interval: float = 0.8):
-    """fn を別スレッドで実行し、終わるまで進捗のスナップショットを yield し続ける。
+# ---------------------------------------------------------------------------
+# ジョブ実行（状態をサーバー側に持つ）
+# ---------------------------------------------------------------------------
+# 以前は「処理の進捗をブラウザとの長い接続に流し続ける」方式だったため、ブラウザのタブを
+# 長く離れて接続が切れると、処理が終わっても画面の進捗が止まったままになることがあった。
+#
+# 今は、処理は別スレッドで進め、状態(進捗・結果)はすべてサーバー側に保存する。
+# 画面は短い問い合わせ(gr.Timer)で状態を取りに来るだけなので、
+#   - タブを離れて接続が切れても、戻った時の次の問い合わせで最新の状態に追いつく
+#   - ブラウザをリロードしても、進行中/完了済みの状態がそのまま復元される
+# 処理自体もブラウザの接続とは無関係に最後まで進む。
 
-    使い方: result = yield from iter_with_progress(...)  /  または next() で受け取る。
-    fn が例外を投げた場合は、ここで再送出する。
+class JobCancelled(RuntimeError):
+    """ユーザーが停止を押したため、処理を中止した。"""
+
+
+KEEP = object()        # 「この出力は変更しない」の印（Gradioではgr.update()に変換する）
+
+UI_KEYS = ("prep_progress", "train_progress", "status", "checkup", "gallery", "tag_rows",
+           "image_rows", "stats", "zip_file", "prepared_dir", "steps", "train_result",
+           "stop_visible", "download", "active")
+
+
+def format_prep_status(res: dict, preset_name: str, will_train: bool) -> str:
+    st = res["stats"]
+    lines = [
+        "### ✅ 学習データの準備ができました",
+        "",
+        f"- 使う画像: **{st['images_used']}枚**"
+        + (f"（{len(st['excluded'])}枚は自動で除外）" if st["excluded"] else ""),
+        f"- 種類: **{preset_name}**",
+    ]
+    if res["trigger"]:
+        lines.append(f"- トリガーワード: `{res['trigger']}` ← 画像を生成する時、プロンプトに入れます")
+    lines.append(f"- おすすめ学習step: 約 **{res['auto_steps']}**")
+    if res.get("memory_note"):
+        lines.append(f"- メモリを空けました: {res['memory_note']}")
+    if will_train:
+        lines += ["", "▶ 続けて学習を開始します。"]
+    else:
+        lines += ["", "内容を確認して、よければ下の「準備済みデータで学習だけ実行」を押してください。"]
+    return "\n".join(lines)
+
+
+def compose_ui(snap: dict, seen: Optional[dict]) -> tuple:
+    """サーバー側の状態から、画面に反映する値を作る。
+
+    seen は「この画面に、どこまで送ったか」の記録。変わっていない出力は KEEP にして送らない
+    （ギャラリーや表を毎秒送り直さないため）。seen が空(初回・リロード)なら全部送る。
+    戻り値: (出力の辞書, 更新後のseen)
     """
-    box: dict = {}
+    seen = dict(seen or {})
+    out = {k: KEEP for k in UI_KEYS}
+    running, stage = snap["running"], snap["stage"]
 
-    def target():
+    bar = render_progress(snap["progress"]) if running else ""
+    prep_html = bar if stage == "prep" else ""
+    train_html = bar if stage == "train" else ""
+    if prep_html != seen.get("prep_html"):
+        out["prep_progress"], seen["prep_html"] = prep_html, prep_html
+    if train_html != seen.get("train_html"):
+        out["train_progress"], seen["train_html"] = train_html, train_html
+
+    if snap["prep_version"] != seen.get("prep_version"):
+        seen["prep_version"] = snap["prep_version"]
+        po = snap["prep_out"]
+        if po is not None:
+            for key in ("status", "checkup", "gallery", "tag_rows", "image_rows", "stats",
+                        "zip_file", "prepared_dir", "steps"):
+                if key in po:
+                    out[key] = po[key]
+
+    if snap["train_version"] != seen.get("train_version"):
+        seen["train_version"] = snap["train_version"]
+        out["train_result"] = snap["train_msg"]
+        out["stop_visible"] = snap["stop_visible"]
+        out["download"] = snap["download"]
+
+    changed = any(v is not KEEP for k, v in out.items() if k != "active")
+    out["active"] = bool(running or changed)      # 変化があった回の、もう1回後に問い合わせを止める
+    return out, seen
+
+
+class JobRunner:
+    """準備・学習を別スレッドで実行し、進捗と結果をサーバー側に保持する。画面の接続とは独立。"""
+
+    def __init__(self, train_module, trainer_module):
+        self.train_module = train_module
+        self.trainer_module = trainer_module
+        self._lock = threading.RLock()
+        self.tracker = ProgressTracker()
+        self.cancel = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.running = False
+        self.stage = ""                  # "prep" | "train"
+        self.loop_started = False        # 学習ループに入ったか
+        self._stop_sent = False
+        self.prep_version = 0
+        self.prep_out: Optional[dict] = None
+        self.train_version = 0
+        self.train_msg = ""
+        self.stop_visible = False
+        self.download: dict = {"visible": False}
+
+    # ---- 画面から見える状態 ----------------------------------------------
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "running": self.running, "stage": self.stage,
+                "progress": self.tracker.snapshot(),
+                "prep_version": self.prep_version, "prep_out": self.prep_out,
+                "train_version": self.train_version, "train_msg": self.train_msg,
+                "stop_visible": self.stop_visible, "download": dict(self.download),
+            }
+
+    def _set_prep(self, out: dict):
+        with self._lock:
+            self.prep_out = out
+            self.prep_version += 1
+
+    def _set_train(self, msg: str, stop_visible: bool, download: Optional[dict] = None):
+        with self._lock:
+            self.train_msg = msg
+            self.stop_visible = stop_visible
+            self.download = download or {"visible": False}
+            self.train_version += 1
+
+    # ---- 開始・停止 ------------------------------------------------------
+    def start(self, plan: dict) -> Optional[str]:
+        """plan = {"prep": prepare_datasetの引数 or None, "train": 学習の引数 or None}。
+        既に実行中なら、画面に出すメッセージを返す（開始しない）。"""
+        with self._lock:
+            if self.running:
+                return "### ⚠️ すでに別の処理を実行中です\n\n終わるまでお待ちください。"
+            self.running = True
+            self.cancel.clear()
+            self.loop_started = False
+            self._stop_sent = False
+            self.stage = "prep" if plan.get("prep") else "train"
+            self.tracker.set("準備中" if plan.get("prep") else "学習の準備中", None, "開始しています")
+            self.thread = threading.Thread(target=self._run, args=(plan,), daemon=True)
+            self.thread.start()
+        return None
+
+    def request_stop(self) -> str:
+        with self._lock:
+            if not self.running:
+                return "実行中の処理はありません。"
+            self.cancel.set()
+            if self.loop_started and not self._stop_sent:
+                self._stop_sent = True
+                self.train_module.stop_time(True)
+                return "停止を要求しました。次の区切りで、ここまでの結果を保存して止まります。"
+        return ("停止を要求しました。モデルのダウンロード中なら中止します（次回は続きから再開します）。"
+                "モデルの読み込み中なら、読み込みが終わった時点で、保存せずに止まります。")
+
+    def _on_loop_step(self, n: int):
+        """学習ループが1stepごとに呼ぶ。読み込み中に押された停止は、ここで反映する。"""
+        with self._lock:
+            self.loop_started = True
+            if self.cancel.is_set() and not self._stop_sent:
+                self._stop_sent = True
+                self.train_module.stop_time(False)   # 学習前の停止は、1stepだけのLoRAを残さない
+
+    def join(self, timeout: Optional[float] = None):
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    # ---- 本体 ------------------------------------------------------------
+    def _run(self, plan: dict):
         try:
-            box["value"] = fn()
-        except BaseException as e:      # noqa: BLE001  スレッドの例外を呼び出し側へ運ぶ
-            box["error"] = e
+            prepared_dir = (plan.get("train") or {}).get("prepared_dir")
+            steps = (plan.get("train") or {}).get("steps")
+            if plan.get("prep"):
+                res = self._do_prep(plan["prep"], will_train=bool(plan.get("train")))
+                if res is None:
+                    return
+                prepared_dir, steps = res["prepared_dir"], res["auto_steps"]
+            if plan.get("train"):
+                self._do_train(plan["train"], prepared_dir, steps)
+        except BaseException as e:           # noqa: BLE001  ここで必ず記録して、画面に出す
+            self._set_train(f"### ❌ 予期しないエラー\n\n{_friendly_error(e)}", False)
+        finally:
+            with self._lock:
+                self.running = False
+                self.stage = ""
+                self.tracker.set("")
+                if self.stop_visible:
+                    self.stop_visible = False
+                    self.train_version += 1
 
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    while thread.is_alive():
-        yield tracker.snapshot()
-        thread.join(interval)
-    if "error" in box:
-        raise box["error"]
-    return box.get("value")
+    def _do_prep(self, kwargs: dict, will_train: bool) -> Optional[dict]:
+        self._set_prep({"status": "", "checkup": "", "gallery": None})   # 前回の結果を消す
+        self.tracker.set("準備中", None, "画像を集めています")
+        try:
+            res = prepare_dataset(
+                **kwargs,
+                progress=lambda frac, desc="": self.tracker.set("準備中", frac, desc),
+            )
+        except Exception as e:
+            self._set_prep({"status": f"### ❌ 準備に失敗しました\n\n{_friendly_error(e)}"})
+            return None
+        self._set_prep({
+            "status": format_prep_status(res, kwargs["preset_name"], will_train),
+            "checkup": res["checkup"], "gallery": res["gallery"], "tag_rows": res["tag_rows"],
+            "image_rows": res["image_rows"], "stats": res["stats_json"], "zip_file": res["zip_path"],
+            "prepared_dir": res["prepared_dir"], "steps": res["auto_steps"],
+        })
+        return res
+
+    def _check_cancel(self, done: int = 0, total: int = 0):
+        """停止が押されていれば中断する。ただし、そのファイルのダウンロードが完了した瞬間は中断しない。"""
+        if self.cancel.is_set() and not (total and done >= total):
+            raise JobCancelled("中止しました")
+
+    def _do_train(self, p: dict, prepared_dir: Optional[str], steps: Optional[int]):
+        with self._lock:
+            self.stage = "train"
+            self.loop_started = False
+        self.tracker.set("学習の準備中", None, "準備しています")
+        self._set_train("", True)                                   # 結果を消して、停止ボタンを出す
+
+        saved_path = None
+        try:
+            model = p["model"]
+
+            def on_download(done, total, speed, name=""):
+                self._check_cancel(done, total)
+                gb = 1024 ** 3
+                frac = (done / total) if total else None
+                remain = ((total - done) / speed) if (total and speed) else None
+                detail = name + (" ・ " if name else "")
+                detail += f"{_fmt_gb(done / gb)} / {_fmt_gb(total / gb)}" if total else _fmt_gb(done / gb)
+                if speed:
+                    detail += f" ・ {speed / 1024 ** 2:.1f} MB/s ・ 残り約 {format_duration(remain)}"
+                self.tracker.set("モデルをダウンロード中", frac, detail)
+
+            # 1) モデル本体（★付きで無ければダウンロード）
+            spec = CATALOG_BY_LABEL.get(model)
+            if spec is not None:
+                self.tracker.set("モデルを確認中", None, spec.filename)
+            model_name = resolve_model(model, lambda d, t, s: on_download(d, t, s, spec.filename if spec else ""))
+            self._check_cancel()
+
+            # 2) Animaを選んだ時だけ、VAE と Text Encoder も揃える（無ければダウンロード）
+            companions = companions_for(model)
+            module_paths: list = []
+            if companions:
+                def on_companion(comp, done, total, speed):
+                    self._check_cancel(done, total)
+                    detail = comp.filename + " ・ " + _fmt_gb(done / 1024 ** 3)
+                    if total:
+                        detail += " / " + _fmt_gb(total / 1024 ** 3)
+                    if speed:
+                        detail += f" ・ {speed / 1024 ** 2:.1f} MB/s"
+                    self.tracker.set(f"{comp.label}をダウンロード中",
+                                     (done / total) if total else None, detail)
+                self.tracker.set("VAE / Text Encoderを確認中", None, "Animaに必要なファイルを確認しています")
+                module_paths = [str(x) for x in ensure_companions(companions, on_companion)]
+            self._check_cancel()
+
+            # 3) メモリを空ける（WebUIのモデルなど）。使用量の数値はコンソールにだけ出す
+            self.tracker.set("メモリを空けています", None, "WebUIのモデルをメモリから解放しています")
+            free_memory(bool(p.get("free_mem")))
+
+            # 4) 学習。ここから「モデルを読み込み中」→「画像の前処理」→「学習中」と進む
+            self._check_cancel()
+            self.tracker.set("モデルを読み込み中", None, "モデルをメモリに読み込んでいます（数十秒〜数分かかります）")
+            modules_ctx = use_webui_modules(module_paths) if module_paths else contextlib.nullcontext()
+            with hook_training_progress(self.train_module, self.tracker, int(steps), self._on_loop_step), \
+                    modules_ctx:
+                message, saved_path = start_training(
+                    self.train_module, self.trainer_module, prepared_dir,
+                    resolve_trigger(p.get("trigger"), p.get("dataset_name", "")),
+                    (p.get("output_name") or "").strip() or p.get("dataset_name"),
+                    p["preset_name"], resolve_image_size(p["size_choice"], model),
+                    int(steps), model_name, p.get("vae"), p.get("te"),
+                )
+        except JobCancelled:
+            message = ("### ⏹ 中止しました\n\n学習は始めていません。"
+                       "ダウンロード途中のファイルは残してあるので、次回は続きから再開します。")
+        except Exception as e:
+            message = f"### ❌ 学習に失敗しました\n\n{_friendly_error(e)}"
+
+        download = {"visible": False}
+        if saved_path:
+            copy = prepare_download(saved_path)
+            if copy:
+                download = {"value": copy, "visible": True,
+                            "label": f"⬇ LoRAをダウンロード（{Path(saved_path).name}）"}
+        self._set_train(message, False, download)
+
+
+_RUNNER: Optional[JobRunner] = None
+
+
+def get_runner(train_module, trainer_module) -> JobRunner:
+    """プロセスで1つだけのJobRunner。WebUIの「Reload UI」をしても、進行中の処理を引き継げる。"""
+    global _RUNNER
+    if _RUNNER is None:
+        _RUNNER = JobRunner(train_module, trainer_module)
+    else:
+        _RUNNER.train_module, _RUNNER.trainer_module = train_module, trainer_module
+    return _RUNNER
 
 
 # ---------------------------------------------------------------------------
@@ -1987,139 +2389,85 @@ def build_easy_tab(
     preset_labels = [f"{k}｜{v['short']}" for k, v in PRESETS.items()]
 
     # ---- イベントハンドラ ---------------------------------------------------
-    # 進捗は標準のgr.Progressを使わず、専用のHTMLバー1つだけに出す。
-    # （gr.Progressは出力先のコンポーネントごとにバーを描くため、3重に表示されてしまう）
+    # 処理はJobRunnerが別スレッドで進め、状態はサーバー側に持つ。ボタンは「開始」を伝えるだけで、
+    # 画面は gr.Timer の短い問い合わせで状態を取りに来る（長い接続に依存しない）。
+    runner = get_runner(train_module, trainer_module)
     NO = gr.update()
+    use_timer = hasattr(gr, "Timer")
 
-    def _run_prep(flag, files, folder_path, dataset_name, preset_label, trigger,
-                  general_threshold, character_threshold, manual_keep, manual_remove, auto_th,
-                  free_mem):
-        preset_name = preset_key_from_label(preset_label)
-        tracker = ProgressTracker()
-        tracker.set("準備中", None, "画像を集めています")
+    def pack(up: dict, seen: dict) -> tuple:
+        """compose_ui の結果を、Gradioの出力（poll_outputsの並び）にする。"""
+        def val(key):
+            return NO if up[key] is KEEP else up[key]
+        stop = NO if up["stop_visible"] is KEEP else gr.update(visible=bool(up["stop_visible"]))
+        steps_u = NO if up["steps"] is KEEP else gr.update(value=int(up["steps"]))
+        download = NO if up["download"] is KEEP else gr.update(**up["download"])
+        values = [val("prep_progress"), val("train_progress"), val("status"), val("checkup"),
+                  val("gallery"), val("tag_rows"), val("image_rows"), val("stats"),
+                  val("zip_file"), val("prepared_dir"), steps_u, val("train_result"),
+                  stop, download, seen]
+        if use_timer:
+            values.append(gr.update(active=bool(up["active"])))
+        return tuple(values)
 
-        def job():
-            return prepare_dataset(
-                files, folder_path, dataset_name, preset_name, trigger,
-                general_threshold, character_threshold, manual_keep, manual_remove,
-                bool(auto_th),
-                progress=lambda frac, desc="": tracker.set("準備中", frac, desc),
-                free_mem=bool(free_mem),
-            )
+    def poll(seen):
+        up, new_seen = compose_ui(runner.snapshot(), seen)
+        return pack(up, new_seen)
 
-        # 前回の結果を消して、進捗だけを見せる
-        yield ("", "", None, NO, NO, NO, NO, NO, NO, "0", render_progress(tracker.snapshot()))
+    def _after_start(refusal):
+        up, seen = compose_ui(runner.snapshot(), {})      # 全部を送り直す
+        if refusal:
+            up["status"] = refusal
+        up["active"] = True                               # 問い合わせを再開する
+        return pack(up, seen)
 
-        gen = iter_with_progress(job, tracker)
-        res = None
-        try:
-            while True:
-                snap = next(gen)
-                yield (NO, NO, NO, NO, NO, NO, NO, NO, NO, "0", render_progress(snap))
-        except StopIteration as stop:
-            res = stop.value
-        except Exception as e:
-            msg = f"### ❌ 準備に失敗しました\n\n{_friendly_error(e)}"
-            yield (msg, "", NO, NO, NO, NO, NO, NO, NO, "0", "")
-            return
+    def _prep_kwargs(files, folder_path, dataset_name, preset_label, trigger, general_threshold,
+                     character_threshold, manual_keep, manual_remove, auto_th, free_mem):
+        return dict(
+            files=files, folder_path=folder_path, dataset_name=dataset_name,
+            preset_name=preset_key_from_label(preset_label), trigger=trigger,
+            general_threshold=general_threshold, character_threshold=character_threshold,
+            manual_keep_text=manual_keep, manual_remove_text=manual_remove,
+            auto_threshold=bool(auto_th), free_mem=bool(free_mem))
 
-        st = res["stats"]
-        lines = [
-            "### ✅ 学習データの準備ができました",
-            "",
-            f"- 使う画像: **{st['images_used']}枚**"
-            + (f"（{len(st['excluded'])}枚は自動で除外）" if st["excluded"] else ""),
-            f"- 種類: **{preset_name}**",
-        ]
-        if res["trigger"]:
-            lines.append(f"- トリガーワード: `{res['trigger']}` ← 画像を生成する時、プロンプトに入れます")
-        lines.append(f"- おすすめ学習step: 約 **{res['auto_steps']}**")
-        if res.get("memory_note"):
-            lines.append(f"- メモリを空けました: {res['memory_note']}")
-        if flag:
-            lines += ["", "▶ 続けて学習を開始します。"]
-        else:
-            lines += ["", "内容を確認して、よければ下の「準備済みデータで学習だけ実行」を押してください。"]
-        yield (
-            "\n".join(lines), res["checkup"], res["gallery"], res["tag_rows"],
-            res["image_rows"], res["stats_json"], res["zip_path"], res["prepared_dir"],
-            gr.update(value=res["auto_steps"]), "1" if flag else "0", "",
-        )
+    def _train_kwargs(prepared_dir, trigger, dataset_name, output_name, preset_label,
+                      size_choice, steps, model, vae, te, free_mem):
+        return dict(
+            prepared_dir=prepared_dir, trigger=trigger, dataset_name=dataset_name,
+            output_name=output_name, preset_name=preset_key_from_label(preset_label),
+            size_choice=size_choice, steps=steps, model=model, vae=vae, te=te,
+            free_mem=bool(free_mem))
 
-    def _prep_only(*args):
-        yield from _run_prep(False, *args)
+    def start_all(files, folder_path, dataset_name, preset_label, trigger, general_threshold,
+                  character_threshold, manual_keep, manual_remove, auto_th, free_mem,
+                  output_name, size_choice, steps, model, vae, te):
+        plan = {
+            "prep": _prep_kwargs(files, folder_path, dataset_name, preset_label, trigger,
+                                 general_threshold, character_threshold, manual_keep,
+                                 manual_remove, auto_th, free_mem),
+            "train": _train_kwargs(None, trigger, dataset_name, output_name, preset_label,
+                                   size_choice, steps, model, vae, te, free_mem),
+        }
+        return _after_start(runner.start(plan))
 
-    def _prep_and_train(*args):
-        yield from _run_prep(True, *args)
+    def start_prep(files, folder_path, dataset_name, preset_label, trigger, general_threshold,
+                   character_threshold, manual_keep, manual_remove, auto_th, free_mem):
+        plan = {"prep": _prep_kwargs(files, folder_path, dataset_name, preset_label, trigger,
+                                     general_threshold, character_threshold, manual_keep,
+                                     manual_remove, auto_th, free_mem),
+                "train": None}
+        return _after_start(runner.start(plan))
 
-    def _train(prepared_dir, trigger, dataset_name, output_name, preset_label,
-               size_choice, steps, model, vae, te, free_mem):
-        # 出力: [進捗バー, 結果, 停止ボタン, 停止メモ, ダウンロードボタン]
-        hide_download = gr.update(visible=False)
-        tracker = ProgressTracker()
-        tracker.set("学習の準備中", None, "準備しています")
-        yield (render_progress(tracker.snapshot()), "", gr.update(visible=True), "", hide_download)
-
-        def on_download(done, total, speed):
-            frac = (done / total) if total else None
-            remain = ((total - done) / speed) if (total and speed) else None
-            gb = 1024 ** 3
-            detail = (f"{_fmt_gb(done / gb)} / {_fmt_gb(total / gb)}" if total else _fmt_gb(done / gb))
-            if speed:
-                detail += f" ・ {speed / 1024 ** 2:.1f} MB/s ・ 残り約 {format_duration(remain)}"
-            tracker.set("モデルをダウンロード中", frac, detail)
-
-        def job():
-            # 1) モデル（★付きで無ければダウンロード）
-            spec = CATALOG_BY_LABEL.get(model)
-            if spec is not None:
-                tracker.set("モデルを確認中", None, spec.filename)
-            model_name = resolve_model(model, on_download)
-            # 2) メモリを空ける（WebUIのモデルなど）
-            tracker.set("メモリを空けています", None, "WebUIのモデルをメモリから解放しています")
-            mem = free_memory(bool(free_mem))
-            tracker.set("学習の準備中", None,
-                        mem["note"] or "モデルを読み込んでいます（数十秒〜数分かかります）")
-            # 3) 学習
-            with hook_training_progress(train_module, tracker, int(steps)):
-                return start_training(
-                    train_module, trainer_module, prepared_dir,
-                    resolve_trigger(trigger, dataset_name),
-                    (output_name or "").strip() or dataset_name,
-                    preset_key_from_label(preset_label),
-                    resolve_image_size(size_choice, model),
-                    int(steps), model_name, vae, te,
-                )
-
-        gen = iter_with_progress(job, tracker)
-        saved_path = None
-        try:
-            while True:
-                snap = next(gen)
-                yield (render_progress(snap), NO, NO, NO, NO)
-        except StopIteration as stop:
-            message, saved_path = stop.value
-        except Exception as e:
-            message = f"### ❌ 学習に失敗しました\n\n{_friendly_error(e)}"
-        # 学習が終わったら進捗バーと停止ボタンを隠し、完成したLoRAのダウンロードボタンを出す
-        download = hide_download
-        if saved_path:
-            copy = prepare_download(saved_path)
-            if copy:
-                download = gr.update(value=copy, visible=True,
-                                     label=f"⬇ LoRAをダウンロード（{Path(saved_path).name}）")
-        yield ("", message, gr.update(visible=False), "", download)
-
-    def _train_if_pending(pending, *args):
-        if pending != "1":
-            yield (NO, NO, NO, NO, NO)
-            return
-        yield from _train(*args)
+    def start_train(prepared_dir, trigger, dataset_name, output_name, preset_label,
+                    size_choice, steps, model, vae, te, free_mem):
+        plan = {"prep": None,
+                "train": _train_kwargs(prepared_dir, trigger, dataset_name, output_name,
+                                       preset_label, size_choice, steps, model, vae, te, free_mem)}
+        return _after_start(runner.start(plan))
 
     def _stop():
         try:
-            train_module.stop_time(True)
-            return "停止を要求しました。次の区切りで、ここまでの結果を保存して止まります。"
+            return runner.request_stop()
         except Exception as e:
             return f"停止できませんでした: {e}"
 
@@ -2165,7 +2513,8 @@ def build_easy_tab(
                                 label="モデル（チェックポイント）", allow_custom_value=True)
             gr.Markdown(
                 "★付きは、モデルが無ければ**学習を始める時に自動でダウンロード**します（Hugging Face）。"
-                "Animaは本体のほかに、WebUI上部の「VAE / Text Encoder」で対応するものを選んでおく必要があります。",
+                "Animaを選んだ時は、必要なVAEとText Encoderも、無ければ自動でダウンロードして使います"
+                "（WebUI上部の選択は、学習の間だけ切り替えて、終わったら元に戻します）。",
                 elem_classes=["tt-easy-note"])
 
         with gr.Row():
@@ -2249,23 +2598,36 @@ def build_easy_tab(
             prepared_dir = gr.Textbox(label="準備済みデータのフォルダ", interactive=True)
             start = gr.Button("学習開始", variant="primary")
 
-        pending = gr.State("0")
+        # ---- 配線 ----------------------------------------------------------
+        seen_state = gr.State({})                 # この画面に、どこまで送ったかの記録
+        timer = gr.Timer(1.0, active=True) if use_timer else None
+        poll_outputs = [prep_progress, train_progress, status, checkup, gallery, tag_table,
+                        image_table, stats, zip_file, prepared_dir, steps, train_result,
+                        stop_btn, lora_download, seen_state]
+        if use_timer:
+            poll_outputs.append(timer)
 
         prep_inputs = [files, folder_path, dataset_name, preset, trigger,
                        general_threshold, character_threshold, manual_keep, manual_remove,
                        auto_threshold, free_mem]
-        prep_outputs = [status, checkup, gallery, tag_table, image_table, stats,
-                        zip_file, prepared_dir, steps, pending, prep_progress]
+        all_inputs = prep_inputs + [output_name, image_size, steps, model, vae, te]
         train_inputs = [prepared_dir, trigger, dataset_name, output_name, preset,
                         image_size, steps, model, vae, te, free_mem]
 
-        train_outputs = [train_progress, train_result, stop_btn, stop_note, lora_download]
-        # show_progress="hidden": 標準の進捗表示は使わない（専用の進捗バーに一本化）
-        hidden = {"show_progress": "hidden"}
+        # queue=False: 開始・停止・問い合わせは一瞬で終わるので、キューを待たせない
+        # show_progress="hidden": Gradio標準の進捗表示は使わない（専用の進捗バーに一本化）
+        fast = {"queue": False, "show_progress": "hidden"}
+        run_prep.click(start_prep, prep_inputs, poll_outputs, **fast)
+        run_all.click(start_all, all_inputs, poll_outputs, **fast)
+        start.click(start_train, train_inputs, poll_outputs, **fast)
+        stop_btn.click(_stop, None, [stop_note], **fast)
 
-        run_prep.click(_prep_only, prep_inputs, prep_outputs, **hidden)
-        run_all.click(_prep_and_train, prep_inputs, prep_outputs, **hidden).then(
-            _train_if_pending, [pending] + train_inputs, train_outputs, **hidden)
-        start.click(_train, train_inputs, train_outputs, **hidden)
-        # 停止は学習中でもすぐ受け付ける（キューを通さない）
-        stop_btn.click(_stop, None, [stop_note], queue=False, **hidden)
+        if use_timer:
+            timer.tick(poll, [seen_state], poll_outputs, **fast)
+        else:
+            # 古いGradio: ページを開いている間、1秒ごとに状態を取りに行く
+            try:
+                gr.context.Context.root_block.load(
+                    poll, [seen_state], poll_outputs, every=1, show_progress="hidden")
+            except Exception as e:
+                print(f"[Easy LoRA] 進捗の自動更新を設定できませんでした: {type(e).__name__}: {e}")
